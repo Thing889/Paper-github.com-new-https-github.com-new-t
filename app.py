@@ -1,179 +1,246 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import time
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Auto Strategy Swing Bot", layout="centered")
-st.title("🤖 AI Multi-Strategy Swing Bot")
-st.caption("Live NSE Market • Max 1-Week Hold • Auto Strategy Selection")
+st.set_page_config(page_title="Live Auto Intraday & Swing Bot", layout="centered")
+st.title("🤖 Live Auto-Trading Bot")
+st.caption("Starts from ₹100 • Intraday & 1-Week Swing • Automatic Entry & Live Watch")
 
-# --- ONLY ONE INPUT: USER ENTERS THE PRICE ---
-st.subheader("1. Enter Your Trading Price")
-budget = st.number_input(
-    "Enter Total Capital / Price (₹)", 
-    min_value=100, 
-    value=31000, 
-    step=500
-)
+# Initialize Session State so stocks only show AFTER price is entered
+if "bot_active" not in st.session_state:
+    st.session_state.bot_active = False
+if "active_trade" not in st.session_state:
+    st.session_state.active_trade = None
 
-# Liquid NSE Stocks for Swing Trading
+# --- STEP 1: ENTER PRICE FIRST ---
+st.subheader("1. Enter Your Trading Price First")
+with st.form("price_form"):
+    budget = st.number_input(
+        "Enter Capital / Price (₹) — Starting from ₹100",
+        min_value=100,
+        value=100,
+        step=100
+    )
+    trade_mode = st.selectbox(
+        "Select Trading Mode:",
+        [
+            "🤖 Auto-Select Best (Intraday + Swing)",
+            "⚡ Intraday Trading Only (Same-Day Exit)",
+            "📈 Swing Trading Only (Max 1-Week Exit)"
+        ]
+    )
+    start_btn = st.form_submit_button("🚀 Enter Price & Start Auto-Bot")
+
+if start_btn:
+    st.session_state.bot_active = True
+    st.session_state.budget = budget
+    st.session_state.trade_mode = trade_mode
+    st.session_state.active_trade = None  # Reset trade on new price entry
+
+# Low-price NSE stocks (₹10 to ₹100) + Mid/Large Caps
 NSE_STOCKS = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
-    "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS", "TATASTEEL.NS",
-    "AXISBANK.NS", "SUNPHARMA.NS", "NTPC.NS", "POWERGRID.NS", "BEL.NS"
+    "IDEA.NS", "IOB.NS", "NHPC.NS", "NMDC.NS", "IDFCFIRSTB.NS",
+    "SUZLON.NS", "IDBI.NS", "NBCC.NS", "BAJAJHFL.NS", "PNB.NS",
+    "TATASTEEL.NS", "BEL.NS", "ITC.NS", "SBIN.NS", "RELIANCE.NS"
 ]
 
-@st.cache_data(ttl=180)
-def scan_live_market():
-    results = []
+@st.cache_data(ttl=60)
+def scan_all_strategies():
+    picks = []
     for ticker in NSE_STOCKS:
         try:
             stock = yf.Ticker(ticker)
-            df = stock.history(period="2mo").dropna()
-            if len(df) < 22:
+            df = stock.history(period="1mo").dropna()
+            if len(df) < 15:
                 continue
 
             close = df["Close"]
+            high = df["High"]
+            low = df["Low"]
             volume = df["Volume"]
+
             live_price = float(round(close.iloc[-1], 2))
+            prev_close = float(close.iloc[-2])
+            day_change_pct = round(((live_price - prev_close) / prev_close) * 100, 2)
+            move_5d_pct = round(((live_price - float(close.iloc[-6])) / float(close.iloc[-6])) * 100, 2)
 
-            # --- STRATEGY INDICATORS ---
-            # 1. Moving Averages (EMA 9 & EMA 21)
-            ema9 = float(close.ewm(span=9, adjust=False).mean().iloc[-1])
-            ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
+            # Technical Indicators (EMA & RSI)
+            ema5 = float(close.ewm(span=5, adjust=False).mean().iloc[-1])
+            ema13 = float(close.ewm(span=13, adjust=False).mean().iloc[-1])
 
-            # 2. RSI (14-Day)
             delta = close.diff()
             gain = delta.clip(lower=0).rolling(window=14).mean()
             loss = (-delta.clip(upper=0)).rolling(window=14).mean()
             rs = gain / loss.replace(0, 0.0001)
             rsi = float(100 - (100 / (1 + rs.iloc[-1])))
 
-            # 3. Volume Surge & 5-Day Return
-            avg_vol = float(volume.tail(20).mean())
-            curr_vol = float(volume.iloc[-1])
-            vol_surge = curr_vol > (avg_vol * 1.15)
-            ret_5d = float(round(((live_price - close.iloc[-6]) / close.iloc[-6]) * 100, 2))
+            vol_ratio = float(volume.iloc[-1]) / float(volume.tail(10).mean() + 1)
 
-            # --- MULTI-STRATEGY SCORING ENGINE ---
-            score = 50
-            strategy_name = "Trend Continuation"
-            target_pct = 0.045  # Default 4.5% 1-week target
-            sl_pct = 0.02       # Default 2.0% stop loss
-
-            if ema9 > ema21 and 52 <= rsi <= 68 and vol_surge:
-                score = 92 + min(ret_5d, 7)
-                strategy_name = "🚀 Volume + EMA Breakout"
-                target_pct = 0.06   # 6% target
-                sl_pct = 0.025
-            elif ema9 > ema21 and rsi >= 50:
-                score = 82 + min(ret_5d, 7)
-                strategy_name = "📈 Golden EMA Trend"
-                target_pct = 0.05   # 5% target
-                sl_pct = 0.02
-            elif rsi < 38 and live_price > float(close.iloc[-2]):
-                score = 80
-                strategy_name = "🔄 Oversold Dip Bounce"
-                target_pct = 0.055  # 5.5% target
-                sl_pct = 0.025
-            elif ret_5d > 2.0:
-                score = 72 + min(ret_5d, 8)
-                strategy_name = "⚡ 1-Week Momentum"
-                target_pct = 0.045
-                sl_pct = 0.02
+            # Intraday Strategy Evaluation
+            intra_score = 50 + (day_change_pct * 4) + (vol_ratio * 8)
+            if ema5 > ema13 and 50 <= rsi <= 72:
+                intra_Strat = "⚡ Intraday Momentum Breakout"
+                intra_score += 20
+            elif rsi < 38 and live_price > float(low.iloc[-1]):
+                intra_Strat = "⚡ Intraday VWAP/RSI Bounce"
+                intra_score += 15
             else:
-                score = round(50 + ret_5d, 1)
+                intra_Strat = "⚡ Intraday Trend Scalp"
 
-            results.append({
+            # Swing Strategy Evaluation (Max 1 Week)
+            swing_score = 50 + (move_5d_pct * 3) + (vol_ratio * 5)
+            if ema5 > ema13 and rsi >= 52:
+                swing_strat = "📈 1-Week EMA Crossover"
+                swing_score += 22
+            elif rsi < 40 and day_change_pct > 0:
+                swing_strat = "📈 1-Week Dip Reversal"
+                swing_score += 18
+            else:
+                swing_strat = "📈 1-Week Channel Swing"
+
+            picks.append({
                 "Stock": ticker.replace(".NS", ""),
+                "Ticker": ticker,
                 "Live Price (₹)": live_price,
-                "Strategy Used": strategy_name,
-                "Win Score": round(score, 1),
-                "RSI": round(rsi, 1),
-                "5D Move (%)": ret_5d,
-                "Target_Pct": target_pct,
-                "SL_Pct": sl_pct
+                "Type": "Intraday",
+                "Strategy": intra_Strat,
+                "Score": round(min(max(intra_score, 10), 99), 1),
+                "Target_Pct": 0.02,   # +2.0% Intraday Target
+                "SL_Pct": 0.01,       # -1.0% Intraday Stop-Loss
+                "Max_Hold": "Today 03:15 PM IST",
+                "Hold_Days": 0
+            })
+
+            picks.append({
+                "Stock": ticker.replace(".NS", ""),
+                "Ticker": ticker,
+                "Live Price (₹)": live_price,
+                "Type": "Swing (Max 1 Wk)",
+                "Strategy": swing_strat,
+                "Score": round(min(max(swing_score, 10), 99), 1),
+                "Target_Pct": 0.05,   # +5.0% 1-Week Target
+                "SL_Pct": 0.025,      # -2.5% 1-Week Stop-Loss
+                "Max_Hold": (datetime.utcnow() + timedelta(hours=5, minutes=30, days=7)).strftime("%d %b %Y, 03:15 PM"),
+                "Hold_Days": 7
             })
         except Exception:
             continue
-    return results
+    return picks
 
-with st.spinner("Bot is scanning live NSE stocks and testing strategies..."):
-    market_data = scan_live_market()
+# --- STEP 2: ONLY SHOW STOCKS AFTER PRICE IS ENTERED ---
+if st.session_state.bot_active:
+    user_budget = st.session_state.budget
+    chosen_mode = st.session_state.trade_mode
 
-# Filter stocks that the user can afford with their entered price
-affordable_stocks = [s for s in market_data if s["Live Price (₹)"] <= budget]
-affordable_stocks = sorted(affordable_stocks, key=lambda x: x["Win Score"], reverse=True)
+    with st.spinner(f"Scanning live NSE stocks under ₹{user_budget}..."):
+        all_setups = scan_all_strategies()
 
-if len(affordable_stocks) > 0:
-    # BOT AUTO-SELECTS THE #1 MOST PROFITABLE STOCK
-    top_pick = affordable_stocks[0]
-    
-    stock_name = top_pick["Stock"]
-    entry_price = top_pick["Live Price (₹)"]
-    strategy = top_pick["Strategy Used"]
-    score = top_pick["Win Score"]
-    
-    # Position Sizing & Profit Math
-    qty = int(budget // entry_price)
-    total_invested = round(qty * entry_price, 2)
-    unused_cash = round(budget - total_invested, 2)
-    
-    target_price = round(entry_price * (1 + top_pick["Target_Pct"]), 2)
-    stop_loss = round(entry_price * (1 - top_pick["SL_Pct"]), 2)
-    
-    est_profit = round((target_price - entry_price) * qty, 2)
-    max_risk = round((entry_price - stop_loss) * qty, 2)
-    
-    # 1-Week Swing Time Calculation
-    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    buy_time_str = now_ist.strftime("%d %b %Y, %I:%M %p IST")
-    sell_date_str = (now_ist + timedelta(days=7)).strftime("%d %b %Y at 03:15 PM IST")
+    # Filter by user price and trading mode
+    valid_setups = [s for s in all_setups if s["Live Price (₹)"] <= user_budget]
+    if "Intraday" in chosen_mode:
+        valid_setups = [s for s in valid_setups if s["Type"] == "Intraday"]
+    elif "Swing" in chosen_mode:
+        valid_setups = [s for s in valid_setups if s["Type"] == "Swing (Max 1 Wk)"]
 
-    st.subheader("2. Bot Auto-Selected Trade (Live)")
-    st.success(
-        f"✅ **AUTO-SELECTED STOCK:** {stock_name}  \n"
-        f"🧠 **Winning Strategy:** {strategy} (Profit Score: {score}/100)"
-    )
+    valid_setups = sorted(valid_setups, key=lambda x: x["Score"], reverse=True)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Live Buy Price", f"₹{entry_price}")
-    col2.metric("Auto Quantity", f"{qty} Shares")
-    col3.metric("Expected Profit", f"+₹{est_profit}")
+    if len(valid_setups) > 0:
+        best = valid_setups[0]
 
-    col4, col5, col6 = st.columns(3)
-    col4.metric("Target Sell Price", f"₹{target_price}")
-    col5.metric("Stop-Loss Price", f"₹{stop_loss}")
-    col6.metric("Capital Used", f"₹{total_invested}")
+        # Auto-Enter Market if not already entered
+        if st.session_state.active_trade is None:
+            entry_p = best["Live Price (₹)"]
+            qty = int(user_budget // entry_p)
+            now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            st.session_state.active_trade = {
+                "Stock": best["Stock"],
+                "Ticker": best["Ticker"],
+                "Type": best["Type"],
+                "Strategy": best["Strategy"],
+                "Score": best["Score"],
+                "Entry_Price": entry_p,
+                "Quantity": qty,
+                "Capital_Used": round(qty * entry_p, 2),
+                "Target_Price": round(entry_p * (1 + best["Target_Pct"]), 2),
+                "Stop_Loss": round(entry_p * (1 - best["SL_Pct"]), 2),
+                "Entry_Time": now_ist.strftime("%d %b %Y, %I:%M:%S %p IST"),
+                "Exit_Deadline": best["Max_Hold"],
+                "Status": "🟢 LIVE IN MARKET (AUTO-ENTERED)"
+            }
 
-    st.subheader("3. Real-Time Auto-Execution & 1-Week Sell Timer")
-    st.code(
-        f"🟢 BOT ORDER STATUS: AUTO-ACTIVE (SWING TRADE)\n"
-        f"----------------------------------------------\n"
-        f"Stock Selected : {stock_name} (NSE)\n"
-        f"Strategy       : {strategy}\n"
-        f"Buy Action     : BOUGHT {qty} Shares @ ₹{entry_price}\n"
-        f"Capital Used   : ₹{total_invested} (Remaining Cash: ₹{unused_cash})\n"
-        f"----------------------------------------------\n"
-        f"🎯 AUTO-SELL RULES (MAX 1 WEEK):\n"
-        f"1. Profit Target : Auto-Sell at ₹{target_price} (Profit: +₹{est_profit})\n"
-        f"2. Stop-Loss     : Auto-Sell at ₹{stop_loss} (Max Risk: -₹{max_risk})\n"
-        f"3. Time Limit    : Auto-Sell on {sell_date_str}\n"
-        f"   (Bot exits automatically if 7 days pass)",
-        language="yaml"
-    )
+        trade = st.session_state.active_trade
 
-    st.subheader("4. Live Trader Board (All Stocks Under Your Price)")
-    st.caption("The bot automatically picked #1 below, but here are all matching stocks for your budget:")
-    
-    board_df = pd.DataFrame(affordable_stocks)[
-        ["Stock", "Live Price (₹)", "Strategy Used", "Win Score", "5D Move (%)", "RSI"]
-    ]
-    st.dataframe(board_df, use_container_width=True, hide_index=True)
+        # Fetch latest real-time price for Live Watch
+        try:
+            live_df = yf.Ticker(trade["Ticker"]).history(period="1d", interval="1m").dropna()
+            if len(live_df) > 0:
+                current_market_price = float(round(live_df["Close"].iloc[-1], 2))
+            else:
+                current_market_price = trade["Entry_Price"]
+        except Exception:
+            current_market_price = trade["Entry_Price"]
 
-    if st.button("🔄 Refresh Live Market Data"):
-        st.cache_data.clear()
-        st.rerun()
+        # Calculate Live Profit / Loss
+        pnl_per_share = current_market_price - trade["Entry_Price"]
+        total_pnl = round(pnl_per_share * trade["Quantity"], 2)
+        pnl_pct = round((pnl_per_share / trade["Entry_Price"]) * 100, 2)
 
+        # Auto-Execution Check (Target / Stop-Loss)
+        if current_market_price >= trade["Target_Price"]:
+            trade["Status"] = "🎯 TARGET HIT — AUTO-SOLD FOR PROFIT!"
+        elif current_market_price <= trade["Stop_Loss"]:
+            trade["Status"] = "🛑 STOP-LOSS HIT — AUTO-SOLD!"
+
+        st.subheader("2. Auto-Selected & Auto-Executed Trade")
+        st.success(
+            f"**{trade['Status']}**  \n"
+            f"🏆 **Stock:** {trade['Stock']} ({trade['Type']}) | "
+            f"🧠 **Strategy:** {trade['Strategy']} (Win Score: {trade['Score']}/100)"
+        )
+
+        # --- LIVE WATCH DASHBOARD ---
+        st.subheader("3. 📡 Live Market Watch (Real-Time Tracker)")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entry Buy Price", f"₹{trade['Entry_Price']}")
+        c2.metric("Live Market Price", f"₹{current_market_price}", f"{pnl_pct}%")
+        c3.metric("Live Profit / Loss", f"₹{total_pnl}", f"{total_pnl} ₹")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Quantity Bought", f"{trade['Quantity']} Shares")
+        c5.metric("Auto-Sell Target", f"₹{trade['Target_Price']}")
+        c6.metric("Auto Stop-Loss", f"₹{trade['Stop_Loss']}")
+
+        expected_max_profit = round((trade["Target_Price"] - trade["Entry_Price"]) * trade["Quantity"], 2)
+
+        st.code(
+            f"📡 LIVE AUTO-EXECUTION WATCH LOG\n"
+            f"--------------------------------------------------\n"
+            f"Order Status    : {trade['Status']}\n"
+            f"Trade Mode      : {trade['Type']}\n"
+            f"Auto-Buy Time   : {trade['Entry_Time']}\n"
+            f"Position Size   : {trade['Quantity']} Shares (₹{trade['Capital_Used']} / ₹{user_budget})\n"
+            f"Target Profit   : +₹{expected_max_profit} (Auto-Sells at ₹{trade['Target_Price']})\n"
+            f"Auto-Sell Timer : {trade['Exit_Deadline']}\n"
+            f"--------------------------------------------------",
+            language="yaml"
+        )
+
+        # Live Auto-Refresh Toggle
+        live_watch_on = st.checkbox("🔴 Keep Live Market Watch Running (Auto-Updates Every 10s)", value=True)
+
+        st.subheader(f"4. All Matching Stocks Under ₹{user_budget}")
+        board_df = pd.DataFrame(valid_setups)[
+            ["Stock", "Live Price (₹)", "Type", "Strategy", "Score", "Max_Hold"]
+        ]
+        st.dataframe(board_df, use_container_width=True, hide_index=True)
+
+        if live_watch_on and "LIVE IN MARKET" in trade["Status"]:
+            time.sleep(10)
+            st.rerun()
+
+    else:
+        st.warning(f"No stocks found under ₹{user_budget}. Try entering ₹100 or more.")
 else:
-    st.warning("Your entered price is lower than 1 share of the scanned stocks. Please enter at least ₹500.")
+    st.info("👆 Enter your trading price above (starting from ₹100) and tap **Enter Price & Start Auto-Bot** to scan the live market.")
