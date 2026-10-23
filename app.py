@@ -27,16 +27,45 @@ STALE_MINUTES = 60
 MIN_AVG_VOLUME = 300_000
 MIN_AVG_TURNOVER = 2e7  # Rs 2 crore traded per day
 
-UNIVERSE = [
-    # budget stocks (Rs 10-100 zone)
+UNIVERSE = list(dict.fromkeys([
+    # ---- budget stocks (roughly Rs 10-150) ----
     "IDEA", "IOB", "NHPC", "NMDC", "SUZLON", "IDFCFIRSTB", "PNB", "NBCC",
     "YESBANK", "SAIL", "BANKBARODA", "IRFC", "RVNL", "GAIL", "TATAPOWER",
     "UNIONBANK", "BHEL", "ONGC", "NTPC", "COALINDIA", "POWERGRID", "WIPRO",
-    "HINDALCO", "VEDL",
-    # large caps
+    "HINDALCO", "VEDL", "CANBK", "UCOBANK", "CENTRALBK", "MAHABANK", "PSB",
+    "BANKINDIA", "INDIANB", "IDBI", "BANDHANBNK", "RBLBANK", "FEDERALBNK",
+    "SOUTHBANK", "KARURVYSYA", "CUB", "DCBBANK", "UJJIVANSFB", "EQUITASBNK",
+    "PFC", "RECLTD", "IREDA", "JPPOWER", "RPOWER", "RELINFRA", "JIOFIN",
+    "NATIONALUM", "HINDCOPPER", "SJVN", "NLCINDIA", "HUDCO", "IRCON",
+    "RAILTEL", "ITI", "HFCL", "MOTHERSON", "ASHOKLEY", "GMRAIRPORT",
+    "JSWENERGY", "NYKAA", "PAYTM", "ETERNAL", "SWIGGY", "POLICYBZR",
+    "OLAELEC", "IEX", "IGL", "PETRONET", "OIL", "GUJGASLTD", "MGL", "NCC",
+    "PNCINFRA", "IRB", "HCC", "JPASSOCIAT", "RENUKA", "BALRAMCHIN",
+    "PCJEWELLER", "RCF", "NFL", "FACT", "GRSE", "MOIL", "GMDCLTD", "WELCORP",
+    "ZEEL", "NETWORK18", "TV18BRDCST", "SUNTV", "PVRINOX", "SAREGAMA",
+    "MANAPPURAM", "MUTHOOTFIN", "IIFL", "PNBHOUSING", "LICHSGFIN",
+    "ABCAPITAL", "POONAWALLA", "TATATECH", "KALYANKJIL", "INOXWIND",
+    "TRIDENT", "HINDZINC", "IOC", "BPCL", "HINDPETRO", "ADANIPOWER",
+    "ADANIGREEN", "TATACOMM", "CDSL", "ANGELONE", "BSE", "MCX",
+    # ---- large and mid caps ----
     "TATASTEEL", "BEL", "ITC", "SBIN", "RELIANCE", "HDFCBANK", "ICICIBANK",
-    "INFY", "TCS", "AXISBANK", "JSWSTEEL",
-]
+    "INFY", "TCS", "AXISBANK", "JSWSTEEL", "KOTAKBANK", "BHARTIARTL", "LT",
+    "HINDUNILVR", "MARUTI", "SUNPHARMA", "TITAN", "ULTRACEMCO", "ASIANPAINT",
+    "NESTLEIND", "BAJFINANCE", "BAJAJFINSV", "HCLTECH", "TECHM", "M&M",
+    "ADANIENT", "ADANIPORTS", "DRREDDY", "CIPLA", "DIVISLAB", "EICHERMOT",
+    "HEROMOTOCO", "BAJAJ-AUTO", "GRASIM", "SHREECEM", "INDUSINDBK",
+    "SBILIFE", "HDFCLIFE", "ICICIPRULI", "ICICIGI", "LICI", "DLF", "LODHA",
+    "GODREJPROP", "OBEROIRLTY", "TRENT", "DMART", "HAL", "BDL", "MAZDOCK",
+    "COCHINSHIP", "BEML", "CGPOWER", "SIEMENS", "ABB", "HAVELLS", "POLYCAB",
+    "KEI", "DIXON", "AMBUJACEM", "ACC", "JINDALSTEL", "APLAPOLLO",
+    "PIDILITIND", "BERGEPAINT", "COLPAL", "DABUR", "GODREJCP", "MARICO",
+    "TATACONSUM", "VBL", "JUBLFOOD", "PAGEIND", "ZYDUSLIFE", "LUPIN",
+    "AUROPHARMA", "BIOCON", "TORNTPHARM", "ALKEM", "GLENMARK", "MAXHEALTH",
+    "APOLLOHOSP", "FORTIS", "TVSMOTOR", "BHARATFORG", "BOSCHLTD", "EXIDEIND",
+    "PERSISTENT", "COFORGE", "MPHASIS", "LTIM", "NAUKRI", "IRCTC", "CONCOR",
+    "INDIGO", "TATAELXSI", "PATANJALI", "SBICARD", "HDFCAMC", "CHOLAFIN",
+    "SHRIRAMFIN", "AUBANK", "JSL",
+]))
 
 MOMENTUM = {"EMA Crossover", "RSI Momentum", "Volume Breakout"}
 REGIME_MULT = {"BULLISH": 1.0, "NEUTRAL": 0.95, "UNKNOWN": 0.95, "BEARISH": 0.85}
@@ -189,17 +218,21 @@ def _extract(raw, ticker):
 
 @st.cache_data(ttl=100, show_spinner=False)
 def fetch_bulk(symbols, interval, period):
-    tickers = [s + ".NS" for s in symbols]
-    try:
-        raw = yf.download(tickers, period=period, interval=interval, group_by="ticker",
-                          auto_adjust=True, progress=False, threads=True)
-    except Exception:
-        return {}
+    """Download in small batches so a big stock list never overloads Yahoo."""
     out = {}
-    for s in symbols:
-        d = _extract(raw, s + ".NS")
-        if d is not None and len(d):
-            out[s] = d
+    batch = 40
+    for i in range(0, len(symbols), batch):
+        chunk = list(symbols[i:i + batch])
+        tickers = [s + ".NS" for s in chunk]
+        try:
+            raw = yf.download(tickers, period=period, interval=interval, group_by="ticker",
+                              auto_adjust=True, progress=False, threads=True)
+        except Exception:
+            continue
+        for s in chunk:
+            d = _extract(raw, s + ".NS")
+            if d is not None and len(d):
+                out[s] = d
     return out
 
 
@@ -454,22 +487,27 @@ def build_candidates(sym, df, mode, regime_state, capital, min_score, check_fres
 @st.cache_data(ttl=120, show_spinner=False)
 def run_scan(capital, allow_intraday, allow_swing, min_score, regime_state, check_fresh):
     daily = fetch_bulk(tuple(UNIVERSE), "1d", "6mo")
-    intr = fetch_bulk(tuple(UNIVERSE), "5m", "5d") if allow_intraday else {}
-    cands, liquid = [], 0
+    liquid, pool = 0, []
     for sym in UNIVERSE:
         dd = daily.get(sym)
         if dd is None or not liquid_ok(dd):
             continue
         liquid += 1
+        if float(dd["Close"].iloc[-1]) <= capital:  # can afford at least 1 share
+            pool.append(sym)
+    # intraday data is only downloaded for stocks that are liquid AND affordable
+    intr = fetch_bulk(tuple(pool), "5m", "5d") if (allow_intraday and pool) else {}
+    cands = []
+    for sym in pool:
         try:
             if allow_swing:
-                cands += build_candidates(sym, dd, "Swing", regime_state, capital, min_score, check_fresh)
+                cands += build_candidates(sym, daily[sym], "Swing", regime_state, capital, min_score, check_fresh)
             if allow_intraday and sym in intr:
                 cands += build_candidates(sym, intr[sym], "Intraday", regime_state, capital, min_score, check_fresh)
         except Exception:
             continue
     cands.sort(key=lambda c: (c["ev"], c["win_score"]), reverse=True)
-    return cands, dict(universe=len(UNIVERSE), loaded=len(daily), liquid=liquid)
+    return cands, dict(universe=len(UNIVERSE), loaded=len(daily), liquid=liquid, affordable=len(pool))
 
 
 # --------------------------- STATE / WALLET ----------------------------
@@ -687,7 +725,8 @@ def seek_entry(S, now, open_now, regime, test_mode):
     with st.spinner("Scanning NSE universe..."):
         cands, stats = run_scan(round(float(S["cash"]), 2), bool(allow_intraday), True,
                                 int(ss.get("min_score", 55)), state, bool(open_now and not test_mode))
-    st.caption(f"Scanned {stats['liquid']} liquid stocks of {stats['universe']} · cash {inr(S['cash'])}")
+    st.caption(f"Scanned {stats['affordable']} stocks you can afford (≤ {inr(S['cash'])}) · "
+               f"{stats['liquid']} liquid of {stats['loaded']} loaded · {stats['universe']} in watch-list")
     if not cands:
         st.warning("No setup passes the Win Score + net-of-charges profit test right now. Re-scanning every 2 minutes.")
         if S["cash"] < 500:
