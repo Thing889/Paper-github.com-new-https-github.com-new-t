@@ -1,700 +1,846 @@
+# ======================================================================
+#  NSE PAPER TRADING BOT - single-file Streamlit app (app.py)
+#  Paper trading only. Live Zerodha orders stay OFF unless you enable them.
+# ======================================================================
+import json
+import math
 import os
-import sqlite3
-import time
-import uuid
-from datetime import datetime, date, time as dt_time, timedelta
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
-# ============================================================
-# NSE PAPER TRADER — SIMULATION ONLY. NO BROKER ORDER API.
-# ============================================================
-APP_TITLE = "NSE Multi-Strategy Paper Trader"
-DB_PATH = os.getenv("PAPER_DB_PATH", "paper_trades.db")
+# ----------------------------- CONFIG ---------------------------------
 IST = ZoneInfo("Asia/Kolkata")
-MARKET_OPEN = dt_time(9, 15)
-MARKET_CLOSE = dt_time(15, 30)
+STATE_FILE = "paper_state.json"
+REFRESH_SECONDS = 10
+MARKET_OPEN, MARKET_CLOSE = dtime(9, 15), dtime(15, 30)
+ENTRY_START = dtime(9, 30)
+NO_NEW_INTRADAY_AFTER = dtime(14, 30)
+NO_NEW_ENTRY_AFTER = dtime(15, 10)
+SWING_MAX_DAYS = 7
+STALE_MINUTES = 60
+MIN_AVG_VOLUME = 300_000
+MIN_AVG_TURNOVER = 2e7  # Rs 2 crore traded per day
 
-# Yahoo Finance symbols. This is a research watchlist, not an
-# endorsement or a guarantee of liquidity/tradability.
-WATCHLIST = {
-    "RELIANCE": "RELIANCE.NS",
-    "HDFCBANK": "HDFCBANK.NS",
-    "ICICIBANK": "ICICIBANK.NS",
-    "SBIN": "SBIN.NS",
-    "INFY": "INFY.NS",
-    "TCS": "TCS.NS",
-    "ITC": "ITC.NS",
-    "TATAMOTORS": "TMPV.NS",
-    "TATASTEEL": "TATASTEEL.NS",
-    "AXISBANK": "AXISBANK.NS",
-    "BHARTIARTL": "BHARTIARTL.NS",
-    "WIPRO": "WIPRO.NS",
-    "ONGC": "ONGC.NS",
-    "NTPC": "NTPC.NS",
-    "POWERGRID": "POWERGRID.NS",
-    "COALINDIA": "COALINDIA.NS",
-    "NHPC": "NHPC.NS",
-    "IDEA": "IDEA.NS",
-    "IOB": "IOB.NS",
-    "IRFC": "IRFC.NS",
-    "TATAPOWER": "TATAPOWER.NS",
-    "BEL": "BEL.NS",
-    "PFC": "PFC.NS",
-    "RECLTD": "RECLTD.NS",
-    "CANBK": "CANBK.NS",
+UNIVERSE = [
+    # budget stocks (Rs 10-100 zone)
+    "IDEA", "IOB", "NHPC", "NMDC", "SUZLON", "IDFCFIRSTB", "PNB", "NBCC",
+    "YESBANK", "SAIL", "BANKBARODA", "IRFC", "RVNL", "GAIL", "TATAPOWER",
+    "UNIONBANK", "BHEL", "ONGC", "NTPC", "COALINDIA", "POWERGRID", "WIPRO",
+    "HINDALCO", "VEDL",
+    # large caps
+    "TATASTEEL", "BEL", "ITC", "SBIN", "RELIANCE", "HDFCBANK", "ICICIBANK",
+    "INFY", "TCS", "AXISBANK", "JSWSTEEL",
+]
+
+MOMENTUM = {"EMA Crossover", "RSI Momentum", "Volume Breakout"}
+REGIME_MULT = {"BULLISH": 1.0, "NEUTRAL": 0.95, "UNKNOWN": 0.95, "BEARISH": 0.85}
+REGIME_ICON = {"BULLISH": "🟢", "NEUTRAL": "🟡", "BEARISH": "🟠", "CRASH": "🔴", "UNKNOWN": "⚪"}
+
+# tp / sl are ATR multiples; horizon = bars used when back-testing a strategy
+MODE_CFG = {
+    "Intraday": dict(interval="5m", period="5d", tp=4.0, sl=2.5, horizon=36),
+    "Swing": dict(interval="1d", period="6mo", tp=2.5, sl=1.5, horizon=5),
 }
 
-st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
+# Zerodha-style charges (edit here if Zerodha changes its rates)
+CHG = {
+    "Intraday": dict(brk_pct=0.0003, brk_cap=20.0, stt_buy=0.0, stt_sell=0.00025,
+                     txn=0.000019, stamp_buy=0.00003, dp=0.0),
+    "Swing": dict(brk_pct=0.0, brk_cap=0.0, stt_buy=0.001, stt_sell=0.001,
+                  txn=0.0000322, stamp_buy=0.00015, dp=15.34),
+}
+SEBI_PER_CRORE = 10.0
+GST_RATE = 0.18
+
+TRADE_COLS = ["id", "symbol", "mode", "strategy", "win_score", "entry_time", "exit_time",
+              "qty", "entry_price", "exit_price", "gross_pnl", "charges", "net_pnl",
+              "exit_reason", "wallet_after"]
 
 
-def now_ist():
-    return datetime.now(IST)
-
-
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db_connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                trade_id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                yahoo_symbol TEXT NOT NULL,
-                strategy TEXT NOT NULL,
-                status TEXT NOT NULL,
-                signal_time TEXT NOT NULL,
-                entry_time TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                quantity INTEGER NOT NULL,
-                stop_price REAL NOT NULL,
-                target_price REAL NOT NULL,
-                score REAL NOT NULL,
-                exit_time TEXT,
-                exit_price REAL,
-                exit_reason TEXT,
-                gross_pnl REAL,
-                estimated_costs REAL,
-                net_pnl REAL,
-                last_price REAL,
-                last_checked TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trade_id TEXT,
-                timestamp TEXT NOT NULL,
-                event TEXT NOT NULL,
-                details TEXT
-            )
-        """)
-        conn.commit()
-
-
-def log_event(conn, trade_id, event, details=""):
-    conn.execute(
-        "INSERT INTO events (trade_id, timestamp, event, details) VALUES (?, ?, ?, ?)",
-        (trade_id, now_ist().isoformat(timespec="seconds"), event, str(details)[:1000]),
-    )
-
-
-def telegram_config():
+# ----------------------------- HELPERS --------------------------------
+def inr(x, d=2):
     try:
-        token = str(st.secrets.get("TELEGRAM_BOT_TOKEN", "")).strip()
-        chat_id = str(st.secrets.get("TELEGRAM_CHAT_ID", "")).strip()
-        return token, chat_id
+        x = float(x)
     except Exception:
-        return "", ""
+        return "—"
+    if not math.isfinite(x):
+        return "—"
+    return f"{'-' if x < 0 else ''}₹{abs(x):,.{d}f}"
 
 
-def send_telegram(message):
-    token, chat_id = telegram_config()
-    if not token or not chat_id:
-        return False, "Telegram not configured"
+def inr_signed(x):
     try:
-        import requests
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
-            timeout=8,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
-            return False, "Telegram API did not confirm delivery"
-        return True, "sent"
-    except Exception as exc:
-        return False, str(exc)[:180]
+        x = float(x)
+    except Exception:
+        return None
+    if not math.isfinite(x):
+        return None
+    return f"{'+' if x >= 0 else '-'}₹{abs(x):,.2f}"
 
 
-def safe_float(value, default=np.nan):
+def fmt_td(td):
+    s = int(td.total_seconds())
+    if s <= 0:
+        return "0m"
+    d, r = divmod(s, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    return (f"{d}d " if d else "") + (f"{h}h " if (h or d) else "") + f"{m}m"
+
+
+def round_tick(x, tick=0.05):
+    return round(round(float(x) / tick) * tick, 2)
+
+
+def secret(name, default=""):
     try:
-        result = float(value)
-        return result if np.isfinite(result) else default
-    except (TypeError, ValueError):
+        return str(st.secrets.get(name, default))
+    except Exception:
         return default
 
 
-def normalize_yf_frame(df):
-    """Flatten recent yfinance MultiIndex columns and normalize OHLCV names."""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        # yf.download(single ticker) may return a MultiIndex in newer versions.
-        out.columns = [str(col[0]) for col in out.columns]
-    out.columns = [str(c).title() for c in out.columns]
-    needed = ["Open", "High", "Low", "Close", "Volume"]
-    if not all(c in out.columns for c in needed):
-        return pd.DataFrame()
-    out = out[needed].copy()
-    for col in needed:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=needed)
-    out = out[(out["Close"] > 0) & (out["High"] > 0) & (out["Low"] > 0)]
-    out = out[out["Volume"] >= 0]
-    return out.sort_index()
+def market_is_open(now):
+    return now.weekday() < 5 and MARKET_OPEN <= now.time() < MARKET_CLOSE
 
 
-@st.cache_data(ttl=45, show_spinner=False)
-def fetch_data(yahoo_symbol, interval):
+def intraday_deadline(now):
+    d = now.replace(hour=15, minute=15, second=0, microsecond=0)
+    if now >= d:
+        d += timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+# ------------------------ BROKERAGE & TAX CALC -------------------------
+def calc_charges(mode, buy_price, sell_price, qty):
+    c = CHG["Swing" if mode == "Swing" else "Intraday"]
+    buy_val, sell_val = float(buy_price) * qty, float(sell_price) * qty
+    turnover = buy_val + sell_val
+    if c["brk_cap"] > 0:
+        brokerage = min(c["brk_cap"], c["brk_pct"] * buy_val) + min(c["brk_cap"], c["brk_pct"] * sell_val)
+    else:
+        brokerage = 0.0
+    stt = c["stt_buy"] * buy_val + c["stt_sell"] * sell_val
+    txn = c["txn"] * turnover
+    sebi = SEBI_PER_CRORE / 1e7 * turnover
+    gst = GST_RATE * (brokerage + sebi + txn)
+    stamp = c["stamp_buy"] * buy_val
+    dp = c["dp"]
+    total = brokerage + stt + txn + sebi + gst + stamp + dp
+    return dict(brokerage=brokerage, stt=stt, txn=txn, sebi=sebi, gst=gst,
+                stamp=stamp, dp=dp, total=total)
+
+
+# --------------------------- DATA LAYER --------------------------------
+def clean(df):
+    """Normalise yfinance output: OHLCV only, numeric, no NaN, IST index."""
+    if df is None or len(df) == 0:
+        return None
     try:
-        if interval == "5m":
-            raw = yf.download(
-                yahoo_symbol, period="5d", interval="5m", auto_adjust=True,
-                progress=False, threads=False, prepost=False, timeout=12,
-            )
-        else:
-            raw = yf.download(
-                yahoo_symbol, period="6mo", interval="1d", auto_adjust=True,
-                progress=False, threads=False, prepost=False, timeout=12,
-            )
-        return normalize_yf_frame(raw)
+        d = df.copy()
+        keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in d.columns]
+        if not {"Open", "High", "Low", "Close"}.issubset(keep):
+            return None
+        d = d[keep].copy()
+        for c in keep:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        if "Volume" not in d.columns:
+            d["Volume"] = 0.0
+        d = d.dropna(subset=["Open", "High", "Low", "Close"])
+        d = d[d["Close"] > 0].copy()
+        d["Volume"] = d["Volume"].fillna(0.0)
+        if len(d) == 0:
+            return None
+        idx = pd.DatetimeIndex(d.index)
+        idx = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
+        d.index = idx
+        d = d[~d.index.duplicated(keep="last")].sort_index()
+        return d
     except Exception:
-        return pd.DataFrame()
+        return None
 
 
-def indicators(df):
-    out = df.copy()
-    out["EMA5"] = out["Close"].ewm(span=5, adjust=False).mean()
-    out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
-    out["EMA13"] = out["Close"].ewm(span=13, adjust=False).mean()
-    out["EMA21"] = out["Close"].ewm(span=21, adjust=False).mean()
-    delta = out["Close"].diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    out["RSI"] = 100 - (100 / (1 + rs))
-    out["VolAvg20"] = out["Volume"].rolling(20, min_periods=10).mean()
-    out["High20"] = out["High"].rolling(20, min_periods=10).max().shift(1)
-    out["Low20"] = out["Low"].rolling(20, min_periods=10).min().shift(1)
+def _extract(raw, ticker):
+    if raw is None or len(raw) == 0:
+        return None
+    try:
+        if isinstance(raw.columns, pd.MultiIndex):
+            lv0 = raw.columns.get_level_values(0)
+            lv1 = raw.columns.get_level_values(1)
+            if ticker in lv0:
+                df = raw[ticker]
+            elif ticker in lv1:
+                df = raw.xs(ticker, axis=1, level=1)
+            else:
+                return None
+        else:
+            df = raw
+        return clean(df)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=100, show_spinner=False)
+def fetch_bulk(symbols, interval, period):
+    tickers = [s + ".NS" for s in symbols]
+    try:
+        raw = yf.download(tickers, period=period, interval=interval, group_by="ticker",
+                          auto_adjust=True, progress=False, threads=True)
+    except Exception:
+        return {}
+    out = {}
+    for s in symbols:
+        d = _extract(raw, s + ".NS")
+        if d is not None and len(d):
+            out[s] = d
     return out
 
 
-def last_timestamp_is_recent(df, interval):
-    if df.empty:
-        return False
-    stamp = df.index[-1]
+@st.cache_data(ttl=8, show_spinner=False)
+def get_live_price(symbol):
+    """Returns (price, timestamp_iso, interval) - never NaN; (None, None, None) if unavailable."""
+    tk = yf.Ticker(symbol + ".NS")
+    for period, interval in (("1d", "1m"), ("5d", "5m"), ("1mo", "1d")):
+        try:
+            h = clean(tk.history(period=period, interval=interval, auto_adjust=True))
+            if h is not None and len(h):
+                p = float(h["Close"].iloc[-1])
+                if math.isfinite(p) and p > 0:
+                    return p, h.index[-1].isoformat(), interval
+        except Exception:
+            continue
+    return None, None, None
+
+
+# ------------------------ NIFTY 50 REGIME FILTER -----------------------
+@st.cache_data(ttl=120, show_spinner=False)
+def get_regime():
+    out = dict(state="UNKNOWN", chg=None, last=None, age_min=None)
     try:
-        ts = pd.Timestamp(stamp)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
-        age = now_ist() - ts.to_pydatetime()
-        # Intraday quotes older than 25 minutes are not used to open positions
-        # during market hours. Daily data is judged by trading date instead.
-        if interval == "5m":
-            if now_ist().weekday() >= 5:
-                return True
-            return age <= timedelta(minutes=25) or now_ist().time() < MARKET_OPEN
-        return ts.date() >= (now_ist().date() - timedelta(days=4))
+        tk = yf.Ticker("^NSEI")
+        d = clean(tk.history(period="6mo", interval="1d", auto_adjust=True))
+        i = clean(tk.history(period="5d", interval="5m", auto_adjust=True))
+    except Exception:
+        return out
+    if d is None or len(d) < 25:
+        return out
+    closes = d["Close"]
+    last = float(closes.iloc[-1])
+    if i is not None and len(i):
+        out["age_min"] = (datetime.now(IST) - i.index[-1].to_pydatetime()).total_seconds() / 60.0
+        if i.index[-1].date() == d.index[-1].date():
+            last = float(i["Close"].iloc[-1])
+    prev = float(closes.iloc[-2])
+    chg = (last / prev - 1.0) * 100.0
+    e20 = float(ema(closes, 20).iloc[-1])
+    e50 = float(ema(closes, 50).iloc[-1])
+    ret5 = (last / float(closes.iloc[-6]) - 1.0) * 100.0 if len(closes) >= 6 else 0.0
+    above20, above50 = last > e20, last > e50
+    if chg <= -1.5 or (chg <= -1.0 and not above20):
+        state = "CRASH"
+    elif (not above20 and not above50) or chg <= -0.7 or ret5 <= -3.0:
+        state = "BEARISH"
+    elif above20 and above50 and e20 > e50 and chg >= -0.2:
+        state = "BULLISH"
+    else:
+        state = "NEUTRAL"
+    out.update(state=state, chg=round(chg, 2), last=round(last, 2))
+    return out
+
+
+# ----------------------------- INDICATORS ------------------------------
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(s, n=14):
+    dlt = s.diff()
+    up = dlt.clip(lower=0.0)
+    dn = -dlt.clip(upper=0.0)
+    ru = up.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    rd = dn.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    rs = ru / rd.replace(0, np.nan)
+    out = 100.0 - 100.0 / (1.0 + rs)
+    out = out.where(~((rd == 0) & (ru > 0)), 100.0)
+    return out.fillna(50.0)
+
+
+def atr(d, n=14):
+    pc = d["Close"].shift(1)
+    tr = pd.concat([d["High"] - d["Low"], (d["High"] - pc).abs(), (d["Low"] - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+
+
+def add_indicators(df):
+    if df is None or len(df) < 60:
+        return None
+    d = df.copy()
+    c = d["Close"]
+    d["ema9"], d["ema21"], d["ema50"] = ema(c, 9), ema(c, 21), ema(c, 50)
+    d["rsi"] = rsi(c, 14)
+    d["atr"] = atr(d, 14)
+    d["vol_avg"] = d["Volume"].rolling(20).mean()
+    d["hh20"] = d["High"].rolling(20).max().shift(1)
+    d = d.dropna(subset=["atr", "ema50"])
+    return d if len(d) >= 40 else None
+
+
+# ------------------------------ STRATEGIES -----------------------------
+def strategy_signals(d):
+    c, o = d["Close"], d["Open"]
+    cross = (d["ema9"] > d["ema21"]) & (d["ema9"].shift(1) <= d["ema21"].shift(1))
+    return {
+        "EMA Crossover": cross & (c > d["ema50"]),
+        "RSI Momentum": d["rsi"].between(55, 72) & (d["rsi"] > d["rsi"].shift(3))
+                        & (c > d["ema21"]) & (d["ema21"] > d["ema50"]),
+        "Oversold Dip Reversal": (d["rsi"].rolling(5).min() < 33) & (d["rsi"] > d["rsi"].shift(1))
+                                 & (c > o) & (c > c.shift(1)),
+        "Volume Breakout": (c > d["hh20"]) & (d["Volume"] > 1.5 * d["vol_avg"]) & (c > o),
+    }
+
+
+def freshness(s):
+    v = [bool(x) for x in s.iloc[-3:].tolist()]
+    if v and v[-1]:
+        return 1.0
+    if len(v) > 1 and v[-2]:
+        return 0.8
+    if len(v) > 2 and v[-3]:
+        return 0.6
+    return 0.0
+
+
+def quality(name, d):
+    r = d.iloc[-1]
+    rv = float(r["rsi"])
+    if name == "EMA Crossover":
+        return 0.75 + (0.25 if 50 <= rv <= 70 else 0.0)
+    if name == "RSI Momentum":
+        return float(np.clip(1 - abs(rv - 62) / 20.0, 0.5, 1.0))
+    if name == "Oversold Dip Reversal":
+        return float(np.clip(0.6 + (35 - float(d["rsi"].iloc[-6:].min())) / 50.0, 0.6, 1.0))
+    va = float(r["vol_avg"])
+    ratio = float(r["Volume"]) / va if va > 0 else 1.0
+    return float(np.clip(0.5 + (ratio - 1.5) * 0.25, 0.5, 1.0))
+
+
+def trend_score(d):
+    r = d.iloc[-1]
+    if r["Close"] > r["ema50"] and r["ema21"] > r["ema50"]:
+        return 1.0
+    if r["Close"] > r["ema50"]:
+        return 0.6
+    return 0.3
+
+
+def rel_volume(d):
+    va = float(d["vol_avg"].iloc[-1])
+    if not (va > 0):
+        return 0.5
+    return float(np.clip(d["Volume"].iloc[-3:].mean() / va / 1.5, 0.0, 1.0))
+
+
+def backtest(d, s, cfg, day_ids=None):
+    """Replay a strategy's past signals with the same ATR target/stop. Returns (n, wins)."""
+    c, o = d["Close"].values, d["Open"].values
+    h, l, a = d["High"].values, d["Low"].values, d["atr"].values
+    sig = s.fillna(False).values.astype(bool)
+    n = wins = 0
+    nxt = 0
+    for i in np.flatnonzero(sig[: max(len(sig) - 2, 0)]):
+        if i < nxt or not (np.isfinite(a[i]) and a[i] > 0):
+            continue
+        entry = o[i + 1] if np.isfinite(o[i + 1]) else c[i]
+        tp, sl = entry + cfg["tp"] * a[i], entry - cfg["sl"] * a[i]
+        last_j = min(i + cfg["horizon"], len(c) - 1)
+        outcome = None
+        for j in range(i + 1, last_j + 1):
+            if day_ids is not None and day_ids[j] != day_ids[i]:
+                last_j = j - 1
+                break
+            if l[j] <= sl:
+                outcome = False
+                break
+            if h[j] >= tp:
+                outcome = True
+                break
+        if outcome is None:
+            if last_j <= i:
+                continue
+            outcome = bool(c[last_j] > entry)
+        n += 1
+        wins += int(outcome)
+        nxt = i + cfg["horizon"]
+    return n, wins
+
+
+def make_plan(mode, entry, atr_v, capital):
+    """Size the position and compute target/stop plus NET (after-charges) outcomes."""
+    cfg = MODE_CFG[mode]
+    if not (entry > 0 and atr_v > 0):
+        return None
+    qty = int(capital // entry)
+    if qty < 1:
+        return None
+    tp = round_tick(entry + cfg["tp"] * atr_v)
+    stop = round_tick(entry - cfg["sl"] * atr_v)
+    if tp <= entry or stop <= 0 or stop >= entry:
+        return None
+    net_tp = (tp - entry) * qty - calc_charges(mode, entry, tp, qty)["total"]
+    net_sl = (stop - entry) * qty - calc_charges(mode, entry, stop, qty)["total"]
+    if net_tp <= 0:
+        return None
+    rr = net_tp / abs(net_sl) if net_sl < 0 else 9.0
+    return dict(qty=qty, tp=tp, stop=stop, net_tp=net_tp, net_sl=net_sl, rr=rr)
+
+
+def liquid_ok(dd):
+    try:
+        t = dd.tail(20)
+        return (float(t["Volume"].mean()) >= MIN_AVG_VOLUME
+                and float((t["Volume"] * t["Close"]).mean()) >= MIN_AVG_TURNOVER)
     except Exception:
         return False
 
 
-def score_swing(df):
-    if len(df) < 35:
-        return None
-    x = indicators(df).dropna(subset=["EMA9", "EMA21", "RSI"])
-    if len(x) < 3:
-        return None
-    cur, prev = x.iloc[-1], x.iloc[-2]
-    close = safe_float(cur["Close"])
-    if not np.isfinite(close) or close <= 0:
-        return None
-    bullish = cur["EMA9"] > cur["EMA21"] and close > cur["EMA21"]
-    cross = prev["EMA9"] <= prev["EMA21"] and cur["EMA9"] > cur["EMA21"]
-    rsi = safe_float(cur["RSI"], 50)
-    vol_avg = safe_float(cur["VolAvg20"], 0)
-    volume_ok = vol_avg > 0 and safe_float(cur["Volume"], 0) >= vol_avg * 1.15
-    dip_bounce = 35 <= rsi <= 52 and close > safe_float(prev["Close"], close)
-    if not (bullish or dip_bounce):
-        return None
-    score = 45
-    score += 20 if cross else 0
-    score += 12 if bullish else 0
-    score += 10 if volume_ok else 0
-    score += 8 if 45 <= rsi <= 65 else 0
-    score += 5 if dip_bounce else 0
-    score = min(score, 100)
-    stop_pct = 0.025
-    target_pct = 0.05
-    if rsi >= 72:
-        return None
-    return {
-        "strategy": "Swing",
-        "price": close,
-        "score": float(score),
-        "stop_pct": stop_pct,
-        "target_pct": target_pct,
-        "rsi": rsi,
-        "volume_ok": volume_ok,
-        "signal_time": str(x.index[-1]),
-        "reason": "EMA trend / momentum",
-    }
-
-
-def score_intraday(df):
-    if len(df) < 35:
-        return None
-    x = indicators(df).dropna(subset=["EMA5", "EMA13", "RSI"])
-    if len(x) < 3:
-        return None
-    cur, prev = x.iloc[-1], x.iloc[-2]
-    close = safe_float(cur["Close"])
-    if not np.isfinite(close) or close <= 0:
-        return None
-    rsi = safe_float(cur["RSI"], 50)
-    bullish = cur["EMA5"] > cur["EMA13"] and close > cur["EMA5"]
-    cross = prev["EMA5"] <= prev["EMA13"] and cur["EMA5"] > cur["EMA13"]
-    vol_avg = safe_float(cur["VolAvg20"], 0)
-    volume_ok = vol_avg > 0 and safe_float(cur["Volume"], 0) >= vol_avg * 1.25
-    breakout = safe_float(cur["High20"], np.nan)
-    breakout_ok = np.isfinite(breakout) and close > breakout
-    if not (bullish and (cross or volume_ok or breakout_ok) and 42 <= rsi <= 72):
-        return None
-    score = 48 + (18 if cross else 0) + (14 if volume_ok else 0) + (12 if breakout_ok else 0)
-    score += 8 if 50 <= rsi <= 65 else 0
-    return {
-        "strategy": "Intraday",
-        "price": close,
-        "score": float(min(score, 100)),
-        "stop_pct": 0.012,
-        "target_pct": 0.025,
-        "rsi": rsi,
-        "volume_ok": volume_ok,
-        "signal_time": str(x.index[-1]),
-        "reason": "EMA momentum / volume confirmation",
-    }
-
-
-def scan_market():
-    candidates = []
-    errors = []
-    progress = st.progress(0, text="Scanning watchlist…")
-    total = len(WATCHLIST)
-    for i, (symbol, yahoo_symbol) in enumerate(WATCHLIST.items(), start=1):
-        daily = fetch_data(yahoo_symbol, "1d")
-        if not daily.empty:
-            signal = score_swing(daily)
-            if signal:
-                candidates.append({**signal, "symbol": symbol, "yahoo_symbol": yahoo_symbol, "data_interval": "1d"})
-        intraday = fetch_data(yahoo_symbol, "5m")
-        if not intraday.empty and last_timestamp_is_recent(intraday, "5m"):
-            # Only create intraday entries during the regular market session.
-            local_now = now_ist()
-            if local_now.weekday() < 5 and MARKET_OPEN <= local_now.time() <= MARKET_CLOSE:
-                signal = score_intraday(intraday)
-                if signal:
-                    candidates.append({**signal, "symbol": symbol, "yahoo_symbol": yahoo_symbol, "data_interval": "5m"})
-        if daily.empty and intraday.empty:
-            errors.append(symbol)
-        progress.progress(i / total, text=f"Scanned {i}/{total}: {symbol}")
-    progress.empty()
-    if candidates:
-        result = pd.DataFrame(candidates)
-        result = result.sort_values(["score", "strategy"], ascending=[False, True]).reset_index(drop=True)
-    else:
-        result = pd.DataFrame()
-    return result, errors
-
-
-def estimate_costs(entry, exit_price, qty):
-    # Approximation only; not a broker contract note or tax calculation.
-    turnover = max(0.0, entry * qty) + max(0.0, exit_price * qty)
-    brokerage = min(20.0, entry * qty * 0.0003) + min(20.0, exit_price * qty * 0.0003)
-    exchange_and_tax_estimate = turnover * 0.0012
-    slippage_estimate = turnover * 0.001
-    return brokerage + exchange_and_tax_estimate + slippage_estimate
-
-
-def available_capital(budget, conn):
-    row = conn.execute("SELECT COALESCE(SUM(entry_price * quantity), 0) AS used FROM trades WHERE status='OPEN'").fetchone()
-    used = float(row["used"] or 0)
-    return max(0.0, float(budget) - used)
-
-
-def open_trade(candidate, budget, risk_pct, min_score, conn, alerts_enabled):
-    price = float(candidate["price"])
-    score = float(candidate["score"])
-    if score < min_score or price <= 0:
-        return False, "No candidate passed the score threshold."
-    available = available_capital(budget, conn)
-    risk_cash = budget * risk_pct / 100.0
-    stop_price = round(price * (1 - float(candidate["stop_pct"])), 2)
-    target_price = round(price * (1 + float(candidate["target_pct"])), 2)
-    risk_per_share = price - stop_price
-    if available < price or risk_per_share <= 0:
-        return False, "Insufficient available budget for one share."
-    qty_by_cash = int(available // price)
-    qty_by_risk = int(risk_cash // risk_per_share) if risk_per_share > 0 else 0
-    qty = min(qty_by_cash, qty_by_risk)
-    if qty < 1:
-        return False, "Risk limit is too small to take even one share; no trade opened."
-    trade_id = str(uuid.uuid4())[:8].upper()
-    stamp = now_ist().isoformat(timespec="seconds")
-    conn.execute("""
-        INSERT INTO trades (
-            trade_id, symbol, yahoo_symbol, strategy, status, signal_time,
-            entry_time, entry_price, quantity, stop_price, target_price,
-            score, last_price, last_checked
-        ) VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        trade_id, candidate["symbol"], candidate["yahoo_symbol"], candidate["strategy"],
-        str(candidate["signal_time"]), stamp, price, qty, stop_price, target_price,
-        score, price, stamp,
-    ))
-    log_event(conn, trade_id, "PAPER_ENTRY", f"{candidate['strategy']} {candidate['symbol']} qty={qty} price={price}")
-    conn.commit()
-    if alerts_enabled:
-        send_telegram(
-            f"🟡 PAPER ENTRY\n{candidate['symbol']} ({candidate['strategy']})\n"
-            f"Qty: {qty} | Entry: ₹{price:.2f}\nStop: ₹{stop_price:.2f} | Target: ₹{target_price:.2f}\n"
-            f"Score: {score:.0f}/100\nSIMULATION ONLY"
-        )
-    return True, f"Paper position opened: {qty} share(s) of {candidate['symbol']}."
-
-
-def close_trade(conn, trade, exit_price, reason, alerts_enabled):
-    entry = float(trade["entry_price"])
-    qty = int(trade["quantity"])
-    exit_price = max(0.01, float(exit_price))
-    gross = (exit_price - entry) * qty
-    costs = estimate_costs(entry, exit_price, qty)
-    net = gross - costs
-    stamp = now_ist().isoformat(timespec="seconds")
-    conn.execute("""
-        UPDATE trades SET status='CLOSED', exit_time=?, exit_price=?, exit_reason=?,
-            gross_pnl=?, estimated_costs=?, net_pnl=?, last_price=?, last_checked=?
-        WHERE trade_id=? AND status='OPEN'
-    """, (stamp, exit_price, reason, gross, costs, net, exit_price, stamp, trade["trade_id"]))
-    log_event(conn, trade["trade_id"], reason, f"Exit ₹{exit_price:.2f}; estimated net P&L ₹{net:.2f}")
-    conn.commit()
-    if alerts_enabled:
-        send_telegram(
-            f"🔴 PAPER EXIT — {reason}\n{trade['symbol']} ({trade['strategy']})\n"
-            f"Qty: {qty} | Exit: ₹{exit_price:.2f}\nEstimated net P&L: ₹{net:.2f}\nSIMULATION ONLY"
-        )
-
-
-def manage_open_trades(conn, alerts_enabled):
-    rows = conn.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()
-    for trade in rows:
-        interval = "5m" if trade["strategy"] == "Intraday" else "1d"
-        data = fetch_data(trade["yahoo_symbol"], interval)
-        if data.empty:
+def build_candidates(sym, df, mode, regime_state, capital, min_score, check_fresh):
+    d = add_indicators(df)
+    if d is None:
+        return []
+    price, atr_v = float(d["Close"].iloc[-1]), float(d["atr"].iloc[-1])
+    if not (price > 0 and atr_v > 0) or price > capital:
+        return []
+    if mode == "Intraday" and check_fresh:
+        age = (datetime.now(IST) - d.index[-1].to_pydatetime()).total_seconds() / 60.0
+        if age > 30:
+            return []
+    cfg = MODE_CFG[mode]
+    day_ids = np.array([t.toordinal() for t in d.index.date]) if mode == "Intraday" else None
+    mult = REGIME_MULT.get(regime_state, 0.95)
+    out = []
+    for name, s in strategy_signals(d).items():
+        if regime_state == "BEARISH" and name in MOMENTUM:
             continue
-        price = safe_float(data["Close"].iloc[-1])
-        if not np.isfinite(price) or price <= 0:
+        fresh = freshness(s)
+        if fresh <= 0:
             continue
-        stamp = now_ist()
-        # Do not use stale intraday data as if it were a live quote.
-        if interval == "5m" and not last_timestamp_is_recent(data, "5m"):
+        strength = fresh * quality(name, d)
+        n, wins = backtest(d, s, cfg, day_ids)
+        wr = (wins + 2.5) / (n + 5.0)  # shrunk toward 50% when few signals
+        score = 100.0 * (0.35 * strength + 0.35 * wr + 0.15 * trend_score(d) + 0.15 * rel_volume(d)) * mult
+        if score < min_score:
             continue
-        conn.execute(
-            "UPDATE trades SET last_price=?, last_checked=? WHERE trade_id=? AND status='OPEN'",
-            (price, stamp.isoformat(timespec="seconds"), trade["trade_id"]),
-        )
-        # Conservative candle handling: if one candle spans both levels,
-        # assume stop-loss was hit first. This is a simulation convention.
-        latest = data.iloc[-1]
-        low = safe_float(latest["Low"], price)
-        high = safe_float(latest["High"], price)
-        reason = None
-        exit_price = None
-        # Avoid using the same candle that produced the entry signal to trigger
-        # an exit: its high/low may have happened before the simulated entry.
+        plan = make_plan(mode, price, atr_v, capital)
+        if not plan or plan["rr"] < 1.0:
+            continue
+        p = score / 100.0
+        ev = p * plan["net_tp"] + (1 - p) * plan["net_sl"]
+        if ev <= 0:
+            continue
+        out.append(dict(symbol=sym, mode=mode, strategy=name, price=price, atr=atr_v,
+                        win_score=round(score, 1), hist_wr=int(round(100 * wr)), hist_n=int(n),
+                        qty=int(plan["qty"]), target=float(plan["tp"]), stop=float(plan["stop"]),
+                        net_tp=float(plan["net_tp"]), net_sl=float(plan["net_sl"]), ev=float(ev)))
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def run_scan(capital, allow_intraday, allow_swing, min_score, regime_state, check_fresh):
+    daily = fetch_bulk(tuple(UNIVERSE), "1d", "6mo")
+    intr = fetch_bulk(tuple(UNIVERSE), "5m", "5d") if allow_intraday else {}
+    cands, liquid = [], 0
+    for sym in UNIVERSE:
+        dd = daily.get(sym)
+        if dd is None or not liquid_ok(dd):
+            continue
+        liquid += 1
         try:
-            entry_dt = datetime.fromisoformat(trade["entry_time"])
-            bar_dt = pd.Timestamp(data.index[-1])
-            if bar_dt.tzinfo is None:
-                bar_dt = bar_dt.tz_localize(IST)
-            else:
-                bar_dt = bar_dt.tz_convert(IST)
-            same_entry_candle = (
-                bar_dt.date() == entry_dt.astimezone(IST).date()
-                if interval == "1d"
-                else bar_dt.to_pydatetime() <= entry_dt.astimezone(IST)
-            )
+            if allow_swing:
+                cands += build_candidates(sym, dd, "Swing", regime_state, capital, min_score, check_fresh)
+            if allow_intraday and sym in intr:
+                cands += build_candidates(sym, intr[sym], "Intraday", regime_state, capital, min_score, check_fresh)
         except Exception:
-            same_entry_candle = True
-        if not same_entry_candle and low <= float(trade["stop_price"]) and high >= float(trade["target_price"]):
-            reason = "STOP_LOSS_AMBIGUOUS_CANDLE"
-            exit_price = float(trade["stop_price"])
-        elif not same_entry_candle and low <= float(trade["stop_price"]):
-            reason = "STOP_LOSS_HIT"
-            exit_price = float(trade["stop_price"])
-        elif not same_entry_candle and high >= float(trade["target_price"]):
-            reason = "TARGET_HIT"
-            exit_price = float(trade["target_price"])
-        elif trade["strategy"] == "Intraday" and stamp.weekday() < 5 and stamp.time() >= MARKET_CLOSE:
-            reason = "INTRADAY_SQUARE_OFF"
-            exit_price = price
-        elif trade["strategy"] == "Swing":
+            continue
+    cands.sort(key=lambda c: (c["ev"], c["win_score"]), reverse=True)
+    return cands, dict(universe=len(UNIVERSE), loaded=len(daily), liquid=liquid)
+
+
+# --------------------------- STATE / WALLET ----------------------------
+def new_state(capital):
+    return dict(start_capital=float(capital), cash=float(capital), position=None, trades=[],
+                recent_losses={}, armed=True, created=datetime.now(IST).isoformat())
+
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                S = json.load(f)
+            if isinstance(S, dict) and "cash" in S and "start_capital" in S:
+                S.setdefault("position", None)
+                S.setdefault("trades", [])
+                S.setdefault("recent_losses", {})
+                S.setdefault("armed", True)
+                return S
+    except Exception:
+        pass
+    return None
+
+
+def save_state(S):
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(S, f, default=str)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+def restore_state_from_df(df):
+    if df is None or df.empty or not {"net_pnl", "wallet_after"}.issubset(df.columns):
+        raise ValueError("CSV must be a history file downloaded from this app")
+    first, last = df.iloc[0], df.iloc[-1]
+    S = new_state(float(first["wallet_after"]) - float(first["net_pnl"]))
+    S["cash"] = float(last["wallet_after"])
+    S["trades"] = df.to_dict("records")
+    return S
+
+
+# --------------------- TELEGRAM + KITE (EXECUTION) ---------------------
+def send_telegram(text):
+    token = str(st.session_state.get("tg_token", "") or "").strip()
+    chat = str(st.session_state.get("tg_chat", "") or "").strip()
+    if not token or not chat:
+        return False
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": text}, timeout=8)
+        return r.ok
+    except Exception:
+        return False
+
+
+def kite_place_order(api_key, access_token, symbol, side, qty, mode):
+    """Real Zerodha order. Needs `kiteconnect` in requirements.txt and a fresh daily access token."""
+    try:
+        from kiteconnect import KiteConnect
+    except Exception:
+        return False, "kiteconnect not installed (add it to requirements.txt)"
+    try:
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+        oid = kite.place_order(
+            variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NSE, tradingsymbol=symbol,
+            transaction_type=kite.TRANSACTION_TYPE_BUY if side == "BUY" else kite.TRANSACTION_TYPE_SELL,
+            quantity=int(qty),
+            product=kite.PRODUCT_MIS if mode == "Intraday" else kite.PRODUCT_CNC,
+            order_type=kite.ORDER_TYPE_MARKET)
+        return True, str(oid)
+    except Exception as e:
+        return False, str(e)
+
+
+def execute_order(side, symbol, qty, mode):
+    """Paper by default. A real order is sent only if live mode + confirmation + keys are all set."""
+    ss = st.session_state
+    if not (ss.get("kite_live") and ss.get("kite_confirm") and ss.get("kite_key") and ss.get("kite_token")):
+        return "paper"
+    ok, info = kite_place_order(str(ss["kite_key"]).strip(), str(ss["kite_token"]).strip(),
+                                symbol, side, qty, mode)
+    send_telegram(f"{'✅' if ok else '❌'} Kite {side} {symbol} x{qty}: {info}")
+    return info
+
+
+# --------------------------- TRADE LIFECYCLE ---------------------------
+def open_trade(S, c, entry, plan, now, regime_state):
+    mode = c["mode"]
+    if mode == "Intraday":
+        deadline = intraday_deadline(now)
+    else:
+        deadline = (now + timedelta(days=SWING_MAX_DAYS)).replace(hour=15, minute=15, second=0, microsecond=0)
+    S["position"] = dict(
+        symbol=c["symbol"], mode=mode, strategy=c["strategy"], win_score=float(c["win_score"]),
+        entry_price=float(entry), qty=int(plan["qty"]), entry_time=now.isoformat(),
+        target=float(plan["tp"]), stop=float(plan["stop"]), initial_stop=float(plan["stop"]),
+        atr=float(c["atr"]), highest=float(entry), last_price=float(entry),
+        deadline=deadline.isoformat(), regime=regime_state)
+    S["cash"] = float(S["cash"] - entry * plan["qty"])
+    save_state(S)
+    execute_order("BUY", c["symbol"], plan["qty"], mode)
+    send_telegram(f"🟢 BUY {c['symbol']} x{plan['qty']} @ {inr(entry)}\n{mode} · {c['strategy']} · Win Score {c['win_score']}\n"
+                  f"🎯 {inr(plan['tp'])}  🛑 {inr(plan['stop'])}")
+
+
+def close_trade(S, exit_px, reason, now):
+    pos = S["position"]
+    exit_px = float(exit_px)
+    ch = calc_charges(pos["mode"], pos["entry_price"], exit_px, pos["qty"])
+    gross = (exit_px - pos["entry_price"]) * pos["qty"]
+    net = gross - ch["total"]
+    S["cash"] = float(S["cash"] + exit_px * pos["qty"] - ch["total"])
+    S["trades"].append(dict(
+        id=len(S["trades"]) + 1, symbol=pos["symbol"], mode=pos["mode"], strategy=pos["strategy"],
+        win_score=pos["win_score"], entry_time=pos["entry_time"][:16].replace("T", " "),
+        exit_time=now.strftime("%Y-%m-%d %H:%M"), qty=pos["qty"],
+        entry_price=round(pos["entry_price"], 2), exit_price=round(exit_px, 2),
+        gross_pnl=round(gross, 2), charges=round(ch["total"], 2), net_pnl=round(net, 2),
+        exit_reason=reason, wallet_after=round(S["cash"], 2)))
+    if net < 0:
+        S["recent_losses"][pos["symbol"]] = now.date().isoformat()
+    S["position"] = None
+    S["armed"] = bool(st.session_state.get("auto_next", True))
+    save_state(S)
+    execute_order("SELL", pos["symbol"], pos["qty"], pos["mode"])
+    send_telegram(f"{'✅' if net >= 0 else '🔻'} SELL {pos['symbol']} x{pos['qty']} @ {inr(exit_px)} ({reason})\n"
+                  f"Gross {inr(gross)} · Charges {inr(ch['total'])} · NET {inr(net)}\nWallet {inr(S['cash'])}")
+
+
+def update_trailing(pos, price):
+    """ATR trailing stop: ratchets up with the highest price; locks break-even after 50% of the move."""
+    cfg = MODE_CFG[pos["mode"]]
+    pos["highest"] = max(float(pos.get("highest", pos["entry_price"])), float(price))
+    stop = max(float(pos["stop"]), round_tick(pos["highest"] - cfg["sl"] * pos["atr"]))
+    span = pos["target"] - pos["entry_price"]
+    if span > 0 and (pos["highest"] - pos["entry_price"]) / span >= 0.5:
+        per_share = calc_charges(pos["mode"], pos["entry_price"], pos["entry_price"], pos["qty"])["total"] / pos["qty"]
+        stop = max(stop, round_tick(pos["entry_price"] + per_share * 1.5))
+    pos["stop"] = min(stop, round_tick(pos["target"] - 0.05))
+
+
+# ------------------------------- UI ------------------------------------
+def monitor_position(S, now, open_now, test_mode):
+    pos = S["position"]
+    price, _, _ = get_live_price(pos["symbol"])
+    if price is None or not math.isfinite(price):
+        price = pos.get("last_price") or pos["entry_price"]
+    price = float(price)
+    pos["last_price"] = price
+    deadline = datetime.fromisoformat(pos["deadline"])
+    reason, exit_px = None, price
+    if open_now or test_mode:
+        if price >= pos["target"]:
+            reason, exit_px = "Target hit", pos["target"]
+        else:
+            update_trailing(pos, price)
+            if price <= pos["stop"]:
+                reason = "Trailing stop" if pos["stop"] > pos["initial_stop"] else "Stop-loss"
+    if reason is None and now >= deadline:
+        reason = "3:15 PM auto-exit" if pos["mode"] == "Intraday" else "7-day limit"
+    if reason:
+        close_trade(S, exit_px, reason, now)
+        return True
+    save_state(S)
+
+    entry, qty = pos["entry_price"], pos["qty"]
+    gross = (price - entry) * qty
+    est = calc_charges(pos["mode"], entry, price, qty)["total"]
+    net = gross - est
+    st.subheader(f"{'🟢' if net >= 0 else '🔴'} {pos['symbol']} · {pos['mode']}")
+    st.caption(f"{pos['strategy']} · Win Score {pos['win_score']} · Nifty regime at entry: {pos['regime']}")
+    a, b = st.columns(2)
+    a.metric("Live price", inr(price), f"{(price / entry - 1) * 100:+.2f}%")
+    b.metric("Entry × Qty", f"{inr(entry)} × {qty}")
+    a.metric("Gross P&L", inr(gross))
+    b.metric("Real Net P&L", inr(net), inr_signed(net))
+    a.metric("🎯 Target", inr(pos["target"]))
+    b.metric("🛑 Stop (trailing)", inr(pos["stop"]))
+    span = pos["target"] - pos["stop"]
+    frac = (price - pos["stop"]) / span if span > 0 else 0.0
+    st.progress(float(min(max(frac, 0.0), 1.0)), text="Stop ◀──────▶ Target")
+    st.caption(f"Est. exit charges incl. taxes: {inr(est)} · ⏱ auto-exit {deadline:%a %d %b %H:%M} IST "
+               f"({fmt_td(deadline - now)} left)")
+    if st.button("🚪 Exit now at market price", key="manual_exit"):
+        close_trade(S, price, "Manual exit", now)
+        return True
+    return False
+
+
+def seek_entry(S, now, open_now, regime, test_mode):
+    ss = st.session_state
+    state = regime.get("state", "UNKNOWN")
+    t = now.time()
+    if not S.get("armed", True):
+        st.info("Last trade closed. Tap below to let the bot pick the next one.")
+        if st.button("🔍 Find next trade", key="find_next"):
+            S["armed"] = True
+            save_state(S)
+            return True
+        return False
+    if state == "CRASH":
+        st.error(f"🔴 Nifty crash filter ON ({regime.get('chg')}% today). Bot is staying in cash.")
+        return False
+    can_enter = test_mode or (open_now and ENTRY_START <= t < NO_NEW_ENTRY_AFTER)
+    allow_intraday = True if not can_enter else (test_mode or t < NO_NEW_INTRADAY_AFTER)
+    if not can_enter:
+        st.info("🔴 Market closed (or too late to enter). Preview below — the bot auto-enters from "
+                "9:30 AM IST on the next trading day while this page stays open.")
+    elif not allow_intraday:
+        st.info("After 2:30 PM IST: no new Intraday entries. Scanning Swing only.")
+    with st.spinner("Scanning NSE universe..."):
+        cands, stats = run_scan(round(float(S["cash"]), 2), bool(allow_intraday), True,
+                                int(ss.get("min_score", 55)), state, bool(open_now and not test_mode))
+    st.caption(f"Scanned {stats['liquid']} liquid stocks of {stats['universe']} · cash {inr(S['cash'])}")
+    if not cands:
+        st.warning("No setup passes the Win Score + net-of-charges profit test right now. Re-scanning every 2 minutes.")
+        if S["cash"] < 500:
+            st.caption("Small capital tip: Swing (delivery) pays a flat ₹15.34 DP fee on every sell, so the bot "
+                       "only picks Swing when it still profits after charges.")
+        return False
+    df = pd.DataFrame([{
+        "Stock": c["symbol"], "Mode": c["mode"], "Strategy": c["strategy"], "Win Score": c["win_score"],
+        "Hist WR %": c["hist_wr"], "Qty": c["qty"], "Target": round(c["target"], 2),
+        "Stop": round(c["stop"], 2), "Exp. Net ₹": round(c["ev"], 2)} for c in cands[:5]])
+    st.markdown("**🏆 Top picks (ranked by expected net profit)**")
+    st.dataframe(df, hide_index=True)
+    if not can_enter:
+        return False
+    today = now.date().isoformat()
+    for c in cands[:10]:
+        if S["recent_losses"].get(c["symbol"]) == today:
+            continue
+        px, _, _ = get_live_price(c["symbol"])
+        entry = px if px else c["price"]
+        if px and abs(px / c["price"] - 1) > 0.03:
+            continue
+        plan = make_plan(c["mode"], entry, c["atr"], S["cash"])
+        if not plan:
+            continue
+        open_trade(S, c, entry, plan, now, state)
+        return True
+    st.warning("Top picks could not be entered at live prices. Retrying shortly.")
+    return False
+
+
+@st.fragment(run_every=REFRESH_SECONDS)
+def dashboard():
+    S = st.session_state.get("S")
+    if S is None:
+        return
+    now = datetime.now(IST)
+    top, body = st.container(), st.container()
+    rerun = False
+    regime = dict(state="UNKNOWN", chg=None, age_min=None)
+    open_now = False
+    try:
+        regime = get_regime()
+        age = regime.get("age_min")
+        open_now = market_is_open(now) and age is not None and age < STALE_MINUTES
+        test_mode = bool(st.session_state.get("test_mode"))
+        with body:
+            if S["position"]:
+                rerun = monitor_position(S, now, open_now, test_mode)
+            else:
+                rerun = seek_entry(S, now, open_now, regime, test_mode)
+    except Exception as e:
+        with body:
+            st.warning(f"Data hiccup - retrying automatically. ({type(e).__name__}: {e})")
+    with top:
+        pos = S["position"]
+        held = pos["qty"] * float(pos.get("last_price") or pos["entry_price"]) if pos else 0.0
+        equity = S["cash"] + held
+        pnl = equity - S["start_capital"]
+        st.caption(f"{'🟢 Market OPEN' if open_now else '🔴 Market closed / no fresh data'} · "
+                   f"{now:%a %d %b %H:%M:%S} IST · refresh every {REFRESH_SECONDS}s")
+        chg = regime.get("chg")
+        st.caption(f"{REGIME_ICON.get(regime.get('state'), '⚪')} Nifty 50 regime: {regime.get('state')}"
+                   + (f" ({chg:+.2f}% today)" if chg is not None else ""))
+        a, b = st.columns(2)
+        a.metric("💰 Wallet (cash)", inr(S["cash"]))
+        b.metric("📊 Equity", inr(equity), inr_signed(pnl))
+    if rerun:
+        st.rerun()
+
+
+def history_section(S):
+    st.divider()
+    st.subheader("🧾 Trade history & wallet")
+    trades = S["trades"]
+    if not trades:
+        st.caption("No closed trades yet.")
+        return
+    df = pd.DataFrame(trades)
+    df = df[[c for c in TRADE_COLS if c in df.columns]]
+    n = len(df)
+    wins = int((pd.to_numeric(df["net_pnl"], errors="coerce") > 0).sum())
+    total_net = float(pd.to_numeric(df["net_pnl"], errors="coerce").sum())
+    a, b = st.columns(2)
+    a.metric("Trades / Win rate", f"{n} / {wins / n * 100:.0f}%")
+    b.metric("Total Net P&L", inr(total_net), inr_signed(total_net))
+    if n >= 2:
+        st.line_chart(pd.to_numeric(df["wallet_after"], errors="coerce"))
+    st.dataframe(df.iloc[::-1], hide_index=True)
+    st.download_button("⬇️ Download Trade History (CSV)", df.to_csv(index=False).encode("utf-8"),
+                       file_name="trade_history.csv", mime="text/csv")
+
+
+def sidebar():
+    sb = st.sidebar
+    sb.header("⚙️ Settings")
+    sb.checkbox("Auto-pick next trade after an exit", value=True, key="auto_next")
+    sb.slider("Minimum Win Score", 40, 80, 55, key="min_score")
+    sb.checkbox("Test mode: allow entries when market is closed", value=False, key="test_mode")
+    with sb.expander("📲 Telegram alerts (optional)"):
+        st.text_input("Bot token", value=secret("TELEGRAM_TOKEN"), type="password", key="tg_token")
+        st.text_input("Chat ID", value=secret("TELEGRAM_CHAT_ID"), key="tg_chat")
+        if st.button("Send test alert", key="tg_test"):
+            ok = send_telegram("✅ NSE Paper Bot: Telegram alerts are working.")
+            st.success("Sent!") if ok else st.error("Failed - check token / chat ID.")
+    with sb.expander("🏦 Zerodha Kite live orders (optional)"):
+        st.caption("OFF by default. Real money. Needs `kiteconnect` in requirements.txt and a fresh daily access token.")
+        st.checkbox("Enable LIVE orders", value=False, key="kite_live")
+        st.text_input("API key", value=secret("KITE_API_KEY"), type="password", key="kite_key")
+        st.text_input("Access token", value=secret("KITE_ACCESS_TOKEN"), type="password", key="kite_token")
+        st.checkbox("I understand orders are real and stops are NOT placed at the broker", value=False, key="kite_confirm")
+    with sb.expander("💾 Backup / reset"):
+        up = st.file_uploader("Restore from history CSV", type="csv", key="restore_csv")
+        if up is not None and st.button("Restore", key="restore_btn"):
             try:
-                entry_date = datetime.fromisoformat(trade["entry_time"]).date()
-                # Exit after five calendar trading weekdays have elapsed; holidays
-                # are not individually modeled in this lightweight prototype.
-                weekdays_elapsed = sum(
-                    1 for n in range(1, (stamp.date() - entry_date).days + 1)
-                    if (entry_date + timedelta(days=n)).weekday() < 5
-                )
-                if weekdays_elapsed >= 5:
-                    reason = "MAX_HOLD_EXIT"
-                    exit_price = price
+                st.session_state.S = restore_state_from_df(pd.read_csv(up))
+                save_state(st.session_state.S)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+        st.checkbox("Yes, wipe wallet & history", value=False, key="confirm_reset")
+        if st.button("🗑 Reset bot", key="reset_btn") and st.session_state.get("confirm_reset"):
+            try:
+                if os.path.exists(STATE_FILE):
+                    os.remove(STATE_FILE)
             except Exception:
                 pass
-        if reason:
-            close_trade(conn, trade, exit_price, reason, alerts_enabled)
-    conn.commit()
+            st.session_state.S = None
+            st.rerun()
 
 
-def load_trades(status=None, limit=500):
-    with db_connect() as conn:
-        if status:
-            rows = conn.execute(
-                "SELECT * FROM trades WHERE status=? ORDER BY entry_time DESC LIMIT ?",
-                (status, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?", (limit,)).fetchall()
-    return pd.DataFrame([dict(r) for r in rows])
+def start_screen():
+    cap = st.number_input("Enter your capital / price (₹)", min_value=100.0, value=100.0, step=50.0, format="%.2f")
+    if st.button("▶ Start Bot", type="primary", key="start_btn"):
+        st.session_state.S = new_state(cap)
+        save_state(st.session_state.S)
+        st.rerun()
 
 
-def load_events(limit=200):
-    with db_connect() as conn:
-        rows = conn.execute("SELECT * FROM events ORDER BY event_id DESC LIMIT ?", (limit,)).fetchall()
-    return pd.DataFrame([dict(r) for r in rows])
-
-
-def money(value):
-    return f"₹{value:,.2f}"
-
-
-init_db()
-st.title("📈 NSE Multi-Strategy Paper Trader")
-st.caption("SIMULATION ONLY · Yahoo Finance data · No broker connection · No real orders")
-
-with st.sidebar:
-    st.header("Paper trading controls")
-    budget = st.number_input("Starting budget (₹)", min_value=100.0, max_value=10000000.0, value=1000.0, step=100.0)
-    risk_pct = st.slider("Max planned risk per trade (%)", min_value=0.5, max_value=2.0, value=1.0, step=0.5)
-    min_score = st.slider("Minimum setup score", min_value=50, max_value=90, value=65, step=5)
-    refresh_seconds = st.select_slider("Dashboard refresh", options=[30, 45, 60, 90, 120], value=60)
-    alerts_enabled = st.toggle("Enable Telegram alerts", value=False)
-    auto_scan = st.toggle("Auto-scan on refresh", value=False)
-    st.caption("Keep auto-scan off if you want to limit Yahoo requests. Refreshing does not guarantee real-time data.")
-    st.divider()
-    if st.button("🔄 Scan watchlist now", use_container_width=True):
-        st.session_state["scan_requested"] = True
-    if st.button("🧹 Clear cached market data", use_container_width=True):
-        fetch_data.clear()
-        st.success("Market-data cache cleared.")
-
-with db_connect() as conn:
-    manage_open_trades(conn, alerts_enabled)
-
-open_trades = load_trades("OPEN")
-closed_trades = load_trades("CLOSED")
-total_closed_net = float(closed_trades["net_pnl"].fillna(0).sum()) if not closed_trades.empty else 0.0
-open_pnl = 0.0
-if not open_trades.empty:
-    for _, row in open_trades.iterrows():
-        mark = safe_float(row.get("last_price"), safe_float(row["entry_price"]))
-        open_pnl += (mark - float(row["entry_price"])) * int(row["quantity"])
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Starting budget", money(budget))
-m2.metric("Open positions", str(len(open_trades)))
-m3.metric("Open gross P&L*", money(open_pnl))
-m4.metric("Closed net P&L*", money(total_closed_net))
-st.caption("*Paper estimates only. Costs are approximate and may not reflect actual brokerage, taxes, spreads, or slippage.")
-
-if alerts_enabled:
-    token, chat_id = telegram_config()
-    if token and chat_id:
-        st.success("Telegram alerts enabled and credentials found.")
+def main():
+    st.set_page_config(page_title="NSE Paper Bot", page_icon="📈", layout="centered",
+                       initial_sidebar_state="collapsed")
+    if "S" not in st.session_state:
+        st.session_state.S = load_state()
+    sidebar()
+    st.title("📈 NSE Paper Bot")
+    S = st.session_state.S
+    if S is None:
+        start_screen()
     else:
-        st.warning("Telegram is toggled on, but credentials are missing. Add them in Streamlit Secrets.")
+        dashboard()
+        history_section(S)
 
-scan_requested = st.session_state.pop("scan_requested", False)
-if "candidates" not in st.session_state:
-    st.session_state["candidates"] = pd.DataFrame()
-    st.session_state["scan_errors"] = []
-should_scan = scan_requested or auto_scan
-if should_scan:
-    with st.spinner("Downloading market data and evaluating strategies…"):
-        candidates, errors = scan_market()
-        st.session_state["candidates"] = candidates
-        st.session_state["scan_errors"] = errors
-        st.session_state["scan_time"] = now_ist().strftime("%Y-%m-%d %H:%M:%S IST")
 
-candidates = st.session_state["candidates"]
-if st.session_state.get("scan_time"):
-    st.caption(f"Last scan: {st.session_state['scan_time']}")
-if st.session_state.get("scan_errors"):
-    st.info("No usable data returned for: " + ", ".join(st.session_state["scan_errors"][:15]) +
-            ("…" if len(st.session_state["scan_errors"]) > 15 else ""))
-
-st.subheader("🎯 Best eligible setup")
-if candidates.empty:
-    st.info("No scan results yet. Tap **Scan watchlist now**. If the market is closed or data is unavailable, no intraday setup may appear.")
-else:
-    display_cols = ["symbol", "strategy", "price", "score", "rsi", "volume_ok", "reason"]
-    st.dataframe(
-        candidates[display_cols].rename(columns={
-            "symbol": "Symbol", "strategy": "Strategy", "price": "Price (₹)",
-            "score": "Score", "rsi": "RSI", "volume_ok": "Volume confirmed", "reason": "Signal basis",
-        }),
-        use_container_width=True, hide_index=True,
-    )
-    eligible = candidates[candidates["score"] >= min_score].copy()
-    with db_connect() as conn:
-        existing_open = conn.execute("SELECT COUNT(*) AS n FROM trades WHERE status='OPEN'").fetchone()["n"]
-    if int(existing_open) > 0:
-        st.warning("A paper position is already open. This version opens one position at a time to avoid overlapping exposure.")
-    elif eligible.empty:
-        st.info(f"No setup meets your minimum score of {min_score}. Waiting is allowed.")
-    else:
-        best = eligible.iloc[0].to_dict()
-        price = float(best["price"])
-        stop = round(price * (1 - float(best["stop_pct"])), 2)
-        target = round(price * (1 + float(best["target_pct"])), 2)
-        risk_per_share = max(0.01, price - stop)
-        risk_cash = budget * risk_pct / 100
-        qty_cash = int(budget // price)
-        qty_risk = int(risk_cash // risk_per_share)
-        preview_qty = min(qty_cash, qty_risk)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Selected", f"{best['symbol']} · {best['strategy']}")
-        c2.metric("Indicative entry", money(price))
-        c3.metric("Stop / Target", f"₹{stop:.2f} / ₹{target:.2f}")
-        c4.metric("Estimated quantity", str(max(0, preview_qty)))
-        if preview_qty < 1:
-            st.warning("This setup does not fit the budget and risk limit. No position will be opened.")
-        else:
-            st.write(f"Score **{best['score']:.0f}/100** · Planned risk budget **{money(risk_cash)}** · Approximate target gain before costs **{money((target-price)*preview_qty)}**.")
-            if st.button("🟡 Open paper position", type="primary", use_container_width=True):
-                with db_connect() as conn:
-                    ok, message = open_trade(best, budget, risk_pct, min_score, conn, alerts_enabled)
-                if ok:
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
-
-st.subheader("🟢 Open paper positions")
-if open_trades.empty:
-    st.write("No open paper positions.")
-else:
-    view = open_trades.copy()
-    view["last_price"] = pd.to_numeric(view["last_price"], errors="coerce")
-    view["unrealized_gross_pnl"] = (view["last_price"] - view["entry_price"]) * view["quantity"]
-    st.dataframe(view[[
-        "trade_id", "symbol", "strategy", "entry_time", "entry_price", "last_price",
-        "quantity", "stop_price", "target_price", "score", "unrealized_gross_pnl", "last_checked"
-    ]], use_container_width=True, hide_index=True)
-    st.caption("Open P&L is gross and excludes estimated exit costs. Prices update when the app refreshes and fresh data is available.")
-
-st.subheader("📒 Trade ledger")
-if closed_trades.empty and open_trades.empty:
-    st.write("No trades recorded yet.")
-else:
-    ledger = load_trades(limit=500)
-    preferred = [
-        "trade_id", "symbol", "strategy", "status", "signal_time", "entry_time",
-        "entry_price", "quantity", "stop_price", "target_price", "score",
-        "exit_time", "exit_price", "exit_reason", "gross_pnl", "estimated_costs",
-        "net_pnl", "last_price", "last_checked"
-    ]
-    ledger = ledger[[c for c in preferred if c in ledger.columns]]
-    st.dataframe(ledger, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Download trade ledger CSV",
-        data=ledger.to_csv(index=False).encode("utf-8"),
-        file_name=f"nse_paper_trades_{now_ist().date().isoformat()}.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-with st.expander("🧾 Event log"):
-    events = load_events()
-    if events.empty:
-        st.write("No events yet.")
-    else:
-        st.dataframe(events, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download event log CSV",
-            data=events.to_csv(index=False).encode("utf-8"),
-            file_name=f"nse_paper_events_{now_ist().date().isoformat()}.csv",
-            mime="text/csv",
-        )
-
-with st.expander("ℹ️ Strategy rules and limitations"):
-    st.markdown("""
-    **Intraday:** 5-minute EMA 5/13 trend, RSI range, and at least one crossover,
-    volume-confirmation, or breakout condition. Intraday signals are only considered
-    during the regular weekday session and stale 5-minute data is rejected.
-
-    **Swing:** daily EMA 9/21 trend or a limited momentum dip-bounce condition,
-    with RSI and volume checks. The simulator applies a maximum five-weekday holding
-    rule; exchange holidays are not individually modeled.
-
-    **Scoring:** scores are heuristic filters, not probabilities of winning and not
-    evidence of a profitable strategy. Validate using a proper out-of-sample backtest.
-
-    **Execution simulation:** fills are modeled at signal/threshold prices. A candle
-    that touches both stop and target is conservatively counted as stop-loss first.
-    Gap risk, order-book depth, circuits, real bid/ask spreads, and exact exchange
-    charges are not fully modeled.
-
-    **Data:** yfinance/Yahoo Finance data can be delayed, missing, adjusted, or
-    inconsistent. It is not an exchange-grade execution feed. `dropna()` is applied
-    after OHLCV validation.
-
-    **Hosting:** SQLite on Streamlit Community Cloud is not guaranteed durable across
-    all restarts/redeployments. Download your CSV regularly; use external persistent
-    storage before relying on records for anything important.
-
-    **Trading:** paper trading only. This application does not connect to Zerodha,
-    place real orders, or guarantee returns. It is educational software, not financial advice.
-    """)
-
-st.divider()
-st.caption("NSE Multi-Strategy Paper Trader · Paper mode only · Never store secrets in GitHub")
-
-# Streamlit rerun refresh is for dashboard updates, not a reliable background scheduler.
-if st.toggle("Enable automatic dashboard refresh", value=False, key="dashboard_autorefresh"):
-    st.caption(f"Refreshing every {refresh_seconds} seconds. This does not guarantee continuous execution while the app is asleep.")
-    time.sleep(int(refresh_seconds))
-    st.rerun()
+if __name__ == "__main__":
+    main()
