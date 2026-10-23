@@ -1,246 +1,336 @@
+
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import time
-from datetime import datetime, timedelta
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Live Auto Intraday & Swing Bot", layout="centered")
-st.title("🤖 Live Auto-Trading Bot")
-st.caption("Starts from ₹100 • Intraday & 1-Week Swing • Automatic Entry & Live Watch")
+st.set_page_config(
+    page_title="Algo Paper Trader",
+    page_icon="📈",
+    layout="wide",
+)
 
-# Initialize Session State so stocks only show AFTER price is entered
-if "bot_active" not in st.session_state:
-    st.session_state.bot_active = False
-if "active_trade" not in st.session_state:
-    st.session_state.active_trade = None
+st.title("📈 Algo Paper Trader")
+st.caption("Swing-trading research dashboard · Paper trading only")
 
-# --- STEP 1: ENTER PRICE FIRST ---
-st.subheader("1. Enter Your Trading Price First")
-with st.form("price_form"):
-    budget = st.number_input(
-        "Enter Capital / Price (₹) — Starting from ₹100",
-        min_value=100,
-        value=100,
-        step=100
+st.warning(
+    "SIMULATION ONLY — This app does not connect to Zerodha, "
+    "does not fetch live prices, and cannot place real orders. "
+    "Signals are for research, not financial advice."
+)
+
+# -------------------- Sidebar settings --------------------
+st.sidebar.header("Strategy settings")
+
+capital = st.sidebar.number_input(
+    "Virtual starting capital (₹)",
+    min_value=1000,
+    max_value=10000000,
+    value=25000,
+    step=1000,
+)
+
+fast_window = st.sidebar.slider(
+    "Fast moving average (days)", 2, 50, 10
+)
+slow_window = st.sidebar.slider(
+    "Slow moving average (days)", 5, 200, 30
+)
+
+cost_bps = st.sidebar.number_input(
+    "Estimated cost per trade side (basis points)",
+    min_value=0.0,
+    max_value=100.0,
+    value=10.0,
+    step=1.0,
+    help="10 basis points = 0.10%. This is an assumption, not a quote.",
+)
+
+if fast_window >= slow_window:
+    st.sidebar.error("Fast moving average must be shorter than slow.")
+    st.stop()
+
+# -------------------- Demo data --------------------
+def make_demo_data():
+    """Synthetic example prices. These are NOT real market prices."""
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=300)
+    daily_returns = rng.normal(0.0004, 0.018, len(dates))
+    close = 200 * np.cumprod(1 + daily_returns)
+
+    return pd.DataFrame({
+        "date": dates,
+        "symbol": "DEMO",
+        "open": close * (1 + rng.normal(0, 0.003, len(dates))),
+        "high": close * 1.01,
+        "low": close * 0.99,
+        "close": close,
+        "volume": rng.integers(100000, 1000000, len(dates)),
+    })
+
+# -------------------- Data input --------------------
+st.subheader("1. Choose your price data")
+
+data_source = st.radio(
+    "Data source",
+    ["Try synthetic demo data", "Upload historical CSV"],
+    horizontal=True,
+)
+
+st.caption(
+    "Demo prices are randomly generated for testing the dashboard. "
+    "They are not actual NSE prices and must not be used to judge "
+    "whether the strategy is profitable."
+)
+
+uploaded_file = None
+if data_source == "Upload historical CSV":
+    uploaded_file = st.file_uploader(
+        "Upload a CSV file",
+        type=["csv"],
+        help=(
+            "Required columns: date, symbol, open, high, low, "
+            "close, volume. Dates and prices must be valid."
+        ),
     )
-    trade_mode = st.selectbox(
-        "Select Trading Mode:",
-        [
-            "🤖 Auto-Select Best (Intraday + Swing)",
-            "⚡ Intraday Trading Only (Same-Day Exit)",
-            "📈 Swing Trading Only (Max 1-Week Exit)"
-        ]
-    )
-    start_btn = st.form_submit_button("🚀 Enter Price & Start Auto-Bot")
 
-if start_btn:
-    st.session_state.bot_active = True
-    st.session_state.budget = budget
-    st.session_state.trade_mode = trade_mode
-    st.session_state.active_trade = None  # Reset trade on new price entry
+    if uploaded_file is None:
+        st.info("Upload your CSV to run a backtest.")
+        st.stop()
 
-# Low-price NSE stocks (₹10 to ₹100) + Mid/Large Caps
-NSE_STOCKS = [
-    "IDEA.NS", "IOB.NS", "NHPC.NS", "NMDC.NS", "IDFCFIRSTB.NS",
-    "SUZLON.NS", "IDBI.NS", "NBCC.NS", "BAJAJHFL.NS", "PNB.NS",
-    "TATASTEEL.NS", "BEL.NS", "ITC.NS", "SBIN.NS", "RELIANCE.NS"
-]
-
-@st.cache_data(ttl=60)
-def scan_all_strategies():
-    picks = []
-    for ticker in NSE_STOCKS:
-        try:
-            stock = yf.Ticker(ticker)
-            df = stock.history(period="1mo").dropna()
-            if len(df) < 15:
-                continue
-
-            close = df["Close"]
-            high = df["High"]
-            low = df["Low"]
-            volume = df["Volume"]
-
-            live_price = float(round(close.iloc[-1], 2))
-            prev_close = float(close.iloc[-2])
-            day_change_pct = round(((live_price - prev_close) / prev_close) * 100, 2)
-            move_5d_pct = round(((live_price - float(close.iloc[-6])) / float(close.iloc[-6])) * 100, 2)
-
-            # Technical Indicators (EMA & RSI)
-            ema5 = float(close.ewm(span=5, adjust=False).mean().iloc[-1])
-            ema13 = float(close.ewm(span=13, adjust=False).mean().iloc[-1])
-
-            delta = close.diff()
-            gain = delta.clip(lower=0).rolling(window=14).mean()
-            loss = (-delta.clip(upper=0)).rolling(window=14).mean()
-            rs = gain / loss.replace(0, 0.0001)
-            rsi = float(100 - (100 / (1 + rs.iloc[-1])))
-
-            vol_ratio = float(volume.iloc[-1]) / float(volume.tail(10).mean() + 1)
-
-            # Intraday Strategy Evaluation
-            intra_score = 50 + (day_change_pct * 4) + (vol_ratio * 8)
-            if ema5 > ema13 and 50 <= rsi <= 72:
-                intra_Strat = "⚡ Intraday Momentum Breakout"
-                intra_score += 20
-            elif rsi < 38 and live_price > float(low.iloc[-1]):
-                intra_Strat = "⚡ Intraday VWAP/RSI Bounce"
-                intra_score += 15
-            else:
-                intra_Strat = "⚡ Intraday Trend Scalp"
-
-            # Swing Strategy Evaluation (Max 1 Week)
-            swing_score = 50 + (move_5d_pct * 3) + (vol_ratio * 5)
-            if ema5 > ema13 and rsi >= 52:
-                swing_strat = "📈 1-Week EMA Crossover"
-                swing_score += 22
-            elif rsi < 40 and day_change_pct > 0:
-                swing_strat = "📈 1-Week Dip Reversal"
-                swing_score += 18
-            else:
-                swing_strat = "📈 1-Week Channel Swing"
-
-            picks.append({
-                "Stock": ticker.replace(".NS", ""),
-                "Ticker": ticker,
-                "Live Price (₹)": live_price,
-                "Type": "Intraday",
-                "Strategy": intra_Strat,
-                "Score": round(min(max(intra_score, 10), 99), 1),
-                "Target_Pct": 0.02,   # +2.0% Intraday Target
-                "SL_Pct": 0.01,       # -1.0% Intraday Stop-Loss
-                "Max_Hold": "Today 03:15 PM IST",
-                "Hold_Days": 0
-            })
-
-            picks.append({
-                "Stock": ticker.replace(".NS", ""),
-                "Ticker": ticker,
-                "Live Price (₹)": live_price,
-                "Type": "Swing (Max 1 Wk)",
-                "Strategy": swing_strat,
-                "Score": round(min(max(swing_score, 10), 99), 1),
-                "Target_Pct": 0.05,   # +5.0% 1-Week Target
-                "SL_Pct": 0.025,      # -2.5% 1-Week Stop-Loss
-                "Max_Hold": (datetime.utcnow() + timedelta(hours=5, minutes=30, days=7)).strftime("%d %b %Y, 03:15 PM"),
-                "Hold_Days": 7
-            })
-        except Exception:
-            continue
-    return picks
-
-# --- STEP 2: ONLY SHOW STOCKS AFTER PRICE IS ENTERED ---
-if st.session_state.bot_active:
-    user_budget = st.session_state.budget
-    chosen_mode = st.session_state.trade_mode
-
-    with st.spinner(f"Scanning live NSE stocks under ₹{user_budget}..."):
-        all_setups = scan_all_strategies()
-
-    # Filter by user price and trading mode
-    valid_setups = [s for s in all_setups if s["Live Price (₹)"] <= user_budget]
-    if "Intraday" in chosen_mode:
-        valid_setups = [s for s in valid_setups if s["Type"] == "Intraday"]
-    elif "Swing" in chosen_mode:
-        valid_setups = [s for s in valid_setups if s["Type"] == "Swing (Max 1 Wk)"]
-
-    valid_setups = sorted(valid_setups, key=lambda x: x["Score"], reverse=True)
-
-    if len(valid_setups) > 0:
-        best = valid_setups[0]
-
-        # Auto-Enter Market if not already entered
-        if st.session_state.active_trade is None:
-            entry_p = best["Live Price (₹)"]
-            qty = int(user_budget // entry_p)
-            now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            st.session_state.active_trade = {
-                "Stock": best["Stock"],
-                "Ticker": best["Ticker"],
-                "Type": best["Type"],
-                "Strategy": best["Strategy"],
-                "Score": best["Score"],
-                "Entry_Price": entry_p,
-                "Quantity": qty,
-                "Capital_Used": round(qty * entry_p, 2),
-                "Target_Price": round(entry_p * (1 + best["Target_Pct"]), 2),
-                "Stop_Loss": round(entry_p * (1 - best["SL_Pct"]), 2),
-                "Entry_Time": now_ist.strftime("%d %b %Y, %I:%M:%S %p IST"),
-                "Exit_Deadline": best["Max_Hold"],
-                "Status": "🟢 LIVE IN MARKET (AUTO-ENTERED)"
-            }
-
-        trade = st.session_state.active_trade
-
-        # Fetch latest real-time price for Live Watch
-        try:
-            live_df = yf.Ticker(trade["Ticker"]).history(period="1d", interval="1m").dropna()
-            if len(live_df) > 0:
-                current_market_price = float(round(live_df["Close"].iloc[-1], 2))
-            else:
-                current_market_price = trade["Entry_Price"]
-        except Exception:
-            current_market_price = trade["Entry_Price"]
-
-        # Calculate Live Profit / Loss
-        pnl_per_share = current_market_price - trade["Entry_Price"]
-        total_pnl = round(pnl_per_share * trade["Quantity"], 2)
-        pnl_pct = round((pnl_per_share / trade["Entry_Price"]) * 100, 2)
-
-        # Auto-Execution Check (Target / Stop-Loss)
-        if current_market_price >= trade["Target_Price"]:
-            trade["Status"] = "🎯 TARGET HIT — AUTO-SOLD FOR PROFIT!"
-        elif current_market_price <= trade["Stop_Loss"]:
-            trade["Status"] = "🛑 STOP-LOSS HIT — AUTO-SOLD!"
-
-        st.subheader("2. Auto-Selected & Auto-Executed Trade")
-        st.success(
-            f"**{trade['Status']}**  \n"
-            f"🏆 **Stock:** {trade['Stock']} ({trade['Type']}) | "
-            f"🧠 **Strategy:** {trade['Strategy']} (Win Score: {trade['Score']}/100)"
-        )
-
-        # --- LIVE WATCH DASHBOARD ---
-        st.subheader("3. 📡 Live Market Watch (Real-Time Tracker)")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Entry Buy Price", f"₹{trade['Entry_Price']}")
-        c2.metric("Live Market Price", f"₹{current_market_price}", f"{pnl_pct}%")
-        c3.metric("Live Profit / Loss", f"₹{total_pnl}", f"{total_pnl} ₹")
-
-        c4, c5, c6 = st.columns(3)
-        c4.metric("Quantity Bought", f"{trade['Quantity']} Shares")
-        c5.metric("Auto-Sell Target", f"₹{trade['Target_Price']}")
-        c6.metric("Auto Stop-Loss", f"₹{trade['Stop_Loss']}")
-
-        expected_max_profit = round((trade["Target_Price"] - trade["Entry_Price"]) * trade["Quantity"], 2)
-
-        st.code(
-            f"📡 LIVE AUTO-EXECUTION WATCH LOG\n"
-            f"--------------------------------------------------\n"
-            f"Order Status    : {trade['Status']}\n"
-            f"Trade Mode      : {trade['Type']}\n"
-            f"Auto-Buy Time   : {trade['Entry_Time']}\n"
-            f"Position Size   : {trade['Quantity']} Shares (₹{trade['Capital_Used']} / ₹{user_budget})\n"
-            f"Target Profit   : +₹{expected_max_profit} (Auto-Sells at ₹{trade['Target_Price']})\n"
-            f"Auto-Sell Timer : {trade['Exit_Deadline']}\n"
-            f"--------------------------------------------------",
-            language="yaml"
-        )
-
-        # Live Auto-Refresh Toggle
-        live_watch_on = st.checkbox("🔴 Keep Live Market Watch Running (Auto-Updates Every 10s)", value=True)
-
-        st.subheader(f"4. All Matching Stocks Under ₹{user_budget}")
-        board_df = pd.DataFrame(valid_setups)[
-            ["Stock", "Live Price (₹)", "Type", "Strategy", "Score", "Max_Hold"]
-        ]
-        st.dataframe(board_df, use_container_width=True, hide_index=True)
-
-        if live_watch_on and "LIVE IN MARKET" in trade["Status"]:
-            time.sleep(10)
-            st.rerun()
-
-    else:
-        st.warning(f"No stocks found under ₹{user_budget}. Try entering ₹100 or more.")
+    try:
+        raw = pd.read_csv(uploaded_file)
+    except Exception as exc:
+        st.error(f"Could not read the CSV: {exc}")
+        st.stop()
 else:
-    st.info("👆 Enter your trading price above (starting from ₹100) and tap **Enter Price & Start Auto-Bot** to scan the live market.")
+    raw = make_demo_data()
+
+raw.columns = [str(c).strip().lower() for c in raw.columns]
+
+required = {"date", "symbol", "close"}
+missing = required - set(raw.columns)
+if missing:
+    st.error(
+        "Your CSV is missing required column(s): "
+        + ", ".join(sorted(missing))
+    )
+    st.stop()
+
+raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
+raw["symbol"] = raw["symbol"].astype(str).str.strip().str.upper()
+raw["close"] = pd.to_numeric(raw["close"], errors="coerce")
+
+raw = raw.dropna(subset=["date", "symbol", "close"])
+raw = raw[(raw["symbol"] != "") & (raw["close"] > 0)]
+raw = raw.sort_values(["symbol", "date"])
+
+if raw.empty:
+    st.error("No valid price rows found in the data.")
+    st.stop()
+
+symbols = sorted(raw["symbol"].unique().tolist())
+selected_symbol = st.selectbox("Select a symbol", symbols)
+
+prices = raw[raw["symbol"] == selected_symbol].copy()
+prices = prices.drop_duplicates(subset=["date"], keep="last")
+prices = prices.sort_values("date").reset_index(drop=True)
+
+if len(prices) <= slow_window + 2:
+    st.error(
+        f"Not enough data for a {slow_window}-day moving average. "
+        f"Please upload more historical rows."
+    )
+    st.stop()
+
+# -------------------- Backtest --------------------
+prices["fast_ma"] = prices["close"].rolling(
+    window=fast_window, min_periods=fast_window
+).mean()
+
+prices["slow_ma"] = prices["close"].rolling(
+    window=slow_window, min_periods=slow_window
+).mean()
+
+# Signal is 1 when fast MA is above slow MA; otherwise stay out.
+prices["signal"] = (
+    (prices["fast_ma"] > prices["slow_ma"])
+    & prices["slow_ma"].notna()
+).astype(int)
+
+# Use yesterday's signal for today's return to avoid look-ahead bias.
+prices["position"] = prices["signal"].shift(1).fillna(0)
+
+prices["market_return"] = prices["close"].pct_change().fillna(0)
+prices["turnover"] = prices["position"].diff().abs()
+prices["turnover"] = prices["turnover"].fillna(0)
+
+cost_rate = cost_bps / 10000.0
+prices["strategy_return"] = (
+    prices["position"] * prices["market_return"]
+    - prices["turnover"] * cost_rate
+)
+
+prices["equity"] = capital * (1 + prices["strategy_return"]).cumprod()
+prices["buy_hold_equity"] = capital * (
+    1 + prices["market_return"]
+).cumprod()
+
+prices["peak"] = prices["equity"].cummax()
+prices["drawdown"] = prices["equity"] / prices["peak"] - 1
+
+# -------------------- Results --------------------
+start_equity = float(prices["equity"].iloc[0])
+final_equity = float(prices["equity"].iloc[-1])
+net_pnl = final_equity - capital
+total_return = (final_equity / capital - 1) * 100
+max_drawdown = float(prices["drawdown"].min()) * 100
+
+days = max((prices["date"].iloc[-1] - prices["date"].iloc[0]).days, 1)
+years = days / 365.25
+if years > 0 and final_equity > 0:
+    cagr = ((final_equity / capital) ** (1 / years) - 1) * 100
+else:
+    cagr = 0.0
+
+entries = (
+    (prices["position"] == 1)
+    & (prices["position"].shift(1).fillna(0) == 0)
+).sum()
+
+exits = (
+    (prices["position"] == 0)
+    & (prices["position"].shift(1).fillna(0) == 1)
+).sum()
+
+st.subheader("2. Backtest results")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Virtual final equity", f"₹{final_equity:,.2f}")
+c2.metric("Net P&L vs starting capital", f"₹{net_pnl:,.2f}")
+c3.metric("Total return", f"{total_return:.2f}%")
+c4.metric("Maximum drawdown", f"{max_drawdown:.2f}%")
+
+c5, c6, c7 = st.columns(3)
+c5.metric("Annualized return (approx.)", f"{cagr:.2f}%")
+c6.metric("Entry signals", int(entries))
+c7.metric("Exit signals", int(exits))
+
+st.caption(
+    f"Symbol: {selected_symbol} · "
+    f"Rows: {len(prices)} · "
+    f"Estimated cost: {cost_bps:.1f} bps per side · "
+    f"Strategy: long when fast MA is above slow MA."
+)
+
+# -------------------- Charts --------------------
+st.subheader("3. Equity curve")
+
+fig_equity = go.Figure()
+fig_equity.add_trace(go.Scatter(
+    x=prices["date"],
+    y=prices["equity"],
+    mode="lines",
+    name="Strategy (after estimated costs)",
+))
+fig_equity.add_trace(go.Scatter(
+    x=prices["date"],
+    y=prices["buy_hold_equity"],
+    mode="lines",
+    name="Buy and hold (comparison)",
+    line=dict(dash="dash"),
+))
+fig_equity.add_hline(
+    y=capital,
+    line_dash="dot",
+    annotation_text="Starting capital",
+)
+fig_equity.update_layout(
+    xaxis_title="Date",
+    yaxis_title="Portfolio value (₹)",
+    hovermode="x unified",
+    legend_title="",
+)
+st.plotly_chart(fig_equity, use_container_width=True)
+
+st.subheader("4. Drawdown")
+
+fig_dd = px.area(
+    prices,
+    x="date",
+    y=prices["drawdown"] * 100,
+    labels={"date": "Date", "y": "Drawdown (%)"},
+)
+fig_dd.update_layout(yaxis_title="Drawdown (%)")
+st.plotly_chart(fig_dd, use_container_width=True)
+
+# -------------------- Signals and data --------------------
+st.subheader("5. Latest signal")
+
+latest = prices.iloc[-1]
+if latest["signal"] == 1:
+    st.success(
+        f"{selected_symbol}: FAST MA ABOVE SLOW MA — "
+        "the strategy's current rule is LONG / IN POSITION."
+    )
+else:
+    st.info(
+        f"{selected_symbol}: FAST MA NOT ABOVE SLOW MA — "
+        "the strategy's current rule is OUT / NO POSITION."
+    )
+
+st.caption(
+    "This is a rule-based historical signal, not a live quote or "
+    "a recommendation to buy or sell. Check current prices and "
+    "your own risk limits independently."
+)
+
+st.subheader("6. Recent data and simulated positions")
+
+display = prices[[
+    "date", "symbol", "close", "fast_ma", "slow_ma",
+    "signal", "position", "strategy_return", "equity", "drawdown"
+]].copy()
+
+display["date"] = display["date"].dt.strftime("%Y-%m-%d")
+display = display.rename(columns={
+    "date": "Date",
+    "symbol": "Symbol",
+    "close": "Close",
+    "fast_ma": "Fast MA",
+    "slow_ma": "Slow MA",
+    "signal": "Signal (0/1)",
+    "position": "Position (0/1)",
+    "strategy_return": "Daily strategy return",
+    "equity": "Virtual equity (₹)",
+    "drawdown": "Drawdown (decimal)",
+})
+
+st.dataframe(display.tail(30), use_container_width=True)
+
+csv_bytes = prices.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download backtest results as CSV",
+    data=csv_bytes,
+    file_name=f"{selected_symbol.lower()}_paper_backtest.csv",
+    mime="text/csv",
+)
+
+st.subheader("7. Important limitations")
+st.markdown(
+    """
+    - This is a simple moving-average crossover example, not a proven
+      profitable strategy.
+    - Historical simulations do not predict future returns.
+    - Brokerage, taxes, slippage, liquidity, and real execution may
+      differ from the estimated cost entered above.
+    - The simulator models one selected symbol at a time and does not
+      calculate portfolio-wide allocation across multiple stocks.
+    - No live market feed, Zerodha connection, automatic alerts, or
+      real-order execution is included.
+    - Demo data is synthetic. Upload reliable historical prices before
+      interpreting any backtest.
+    """
+)
+
+st.caption("Algo Paper Trader · Educational use only")
